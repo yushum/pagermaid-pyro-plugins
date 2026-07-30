@@ -14,7 +14,7 @@
 1. 首先，在 Telegram 的任意聊天中向你的 PagerMaid-Pyro 发送以下命令，将本仓库添加为第三方源：
 
 ```text
-,apt_source add https://raw.githubusercontent.com/yushum/pagermaid-pyro-plugins/main
+,apt_source add https://raw.githubusercontent.com/yushum/pagermaid-pyro-plugins/master
 ```
 
 2. 添加源后，使用以下命令安装对应的插件：
