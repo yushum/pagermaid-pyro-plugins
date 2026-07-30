@@ -1,0 +1,24 @@
+{
+  "list": [
+    {
+      "name": "autodelplus",
+      "version": "1.0",
+      "section": "chat",
+      "maintainer": "yusum",
+      "size": "32.94 kb",
+      "supported": true,
+      "des_short": "自动删除消息插件",
+      "des": "设置当前聊天/全局的消息自动删除定时，支持排除特定聊天及远程管理。"
+    },
+    {
+      "name": "summarize_user",
+      "version": "1.0",
+      "section": "chat",
+      "maintainer": "yusum",
+      "size": "30.31 kb",
+      "supported": true,
+      "des_short": "用户画像生成插件",
+      "des": "抓取指定用户在群组的发言，调用AI生成画像分析报告，支持零痕迹及分块分析。"
+    }
+  ]
+}
