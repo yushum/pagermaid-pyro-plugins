@@ -58,7 +58,6 @@ _TIME_UNITS = {
 _MIN_SECONDS = 1
 _MAX_SECONDS = 30 * 86400
 _MAX_DISPLAY_ITEMS = 20
-_MAX_CHAT_JOBS = 5000          # 单聊天最大排队任务数
 _DELETE_BATCH_SIZE = 100       # 单次 delete_messages 的最大消息数
 _MAX_RETRIES = 3               # 未知错误的最大重试次数
 _MAX_FLOOD_RETRIES = 10        # FloodWait 重排上限，防止无限循环
@@ -341,12 +340,21 @@ class AutoDeleteScheduler:
         self.worker_task = asyncio.create_task(self.worker(client))
 
     async def init(self) -> None:
-        """从 DB 恢复任务。扫描在线程池中执行，避免阻塞事件循环。"""
+        """从 DB 恢复任务。
+
+        扫描期间仍可能有新任务入队或旧任务被取消，因此不能
+        直接覆盖内存态。恢复前再确认 DB 键仍存在，并与已入队
+        的任务合并，可同时避免丢任务和复活已取消任务。
+        """
         jobs = await asyncio.to_thread(self._load_jobs_from_db)
-        self.job_heap = jobs
-        heapq.heapify(self.job_heap)
-        self.live = {job.key: job for job in jobs}
-        self.chat_counts = Counter(job.chat_id for job in jobs)
+        for job in jobs:
+            if not isinstance(sqlite.get(_job_key(job.chat_id, job.message_id)), dict):
+                continue
+            if job.key in self.live:
+                continue
+            self.live[job.key] = job
+            self.chat_counts[job.chat_id] += 1
+            heapq.heappush(self.job_heap, job)
 
     def _load_jobs_from_db(self) -> List[DeleteJob]:
         """加载全部任务；顺带迁移 v1 (含时间戳键) 与清理 v2 遗留索引键。"""
@@ -393,12 +401,6 @@ class AutoDeleteScheduler:
 
     def add_job(self, job: DeleteJob) -> bool:
         key = job.key
-        if key not in self.live and self.chat_counts[job.chat_id] >= _MAX_CHAT_JOBS:
-            logs.warning(
-                f"[autodel] 聊天 {job.chat_id} 排队任务已达上限 "
-                f"{_MAX_CHAT_JOBS}，丢弃消息 {job.message_id}"
-            )
-            return False
         if key not in self.live:
             self.chat_counts[job.chat_id] += 1
         self.live[key] = job
@@ -527,9 +529,17 @@ class AutoDeleteScheduler:
                     job.due_at = int(time.time()) + wait + 1
                     self.add_job(job)
         except _DROP_ERRORS as e:
-            # 权限/对象不存在类错误：重试无意义，直接放弃
-            logs.info(f"[autodel] 放弃聊天 {cid} 的 {len(jobs)} 个任务: {type(e).__name__}")
-            for job in jobs:
+            if len(jobs) > 1:
+                # 批量中一条已不存在时，不能连带放弃其他有效消息。
+                for job in jobs:
+                    await self._process_batch(client, cid, [job])
+            else:
+                # 权限/对象不存在类错误：单条重试无意义。
+                job = jobs[0]
+                logs.info(
+                    f"[autodel] 放弃聊天 {cid} 的任务 "
+                    f"{job.message_id}: {type(e).__name__}"
+                )
                 self._db_del(cid, job.message_id)
         except Exception as e:
             if len(jobs) > 1:

@@ -2,10 +2,10 @@
   "list": [
     {
       "name": "autodelplus",
-      "version": "1.0",
+      "version": "1.1",
       "section": "chat",
       "maintainer": "yusum",
-      "size": "32.94 kb",
+      "size": "33.23 kb",
       "supported": true,
       "des_short": "自动删除消息插件",
       "des": "设置当前聊天/全局的消息自动删除定时，支持排除特定聊天及远程管理。"
