@@ -77,7 +77,10 @@ DEFAULT_SYSTEM_PROMPT = (
     "**核心原则：**\n"
     "1. **客观真实**：严格基于用户实际发言内容分析，不得凭空推测。\n"
     "2. **零美化零偏见**：严禁任何讨好、夸大、美化或抹黑倾向，保持绝对中立。\n\n"
-    "**输出结构（请严格按以下维度组织）：**\n"
+    "**输出结构（请严格按以下格式和顺序输出）：**\n\n"
+    "第一行必须是一句话总结，格式如下（不要加任何标题前缀）：\n"
+    "💬 用一句直白、犀利的话概括这个用户的整体特征和印象。\n\n"
+    "然后空一行，输出以下各维度的详细分析：\n"
     "- **主要关注话题/领域**：用户经常讨论什么内容，核心兴趣点是什么。\n"
     "- **发言风格与情绪倾向**：语言风格特征（如正式/口语化、简洁/啰嗦），"
     "整体情绪基调（如平和、激动、讽刺、消极等）。\n"
@@ -87,8 +90,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "有无特定的口头禅或交流习惯。\n"
     "- **客观综合评价**：一段直白、客观、真实的综合评价。\n\n"
     "**格式要求：**\n"
-    "- 直接输出分析结果，不要包含寒暄语或前言。\n"
-    "- 仅使用双星号加粗（即 **文字**）、换行和短横线 - 进行排版。\n"
+    "- 第一行的一句话总结必须以 💬 开头，不超过 50 个字。\n"
+    "- 详细分析部分使用双星号加粗（即 **文字**）、换行和短横线 - 进行排版。\n"
     "- 绝对不要使用 # 标题语法，因为 Telegram 无法渲染。\n"
     "- 不要使用编号列表（1. 2. 3.），统一使用 - 列表。"
 )
@@ -116,15 +119,18 @@ REDUCE_SYSTEM_PROMPT = (
     "- **关注变化**：如果不同时间段的分析之间存在矛盾或变化趋势，"
     "请指出并分析可能的原因（如兴趣转移、情绪波动等）。\n"
     "- **客观中立**：保持绝对中立，不美化不抹黑。\n\n"
-    "**输出结构：**\n"
+    "**输出结构（请严格按以下格式和顺序输出）：**\n\n"
+    "第一行必须是一句话总结，格式如下（不要加任何标题前缀）：\n"
+    "💬 用一句直白、犀利的话概括这个用户的整体特征和印象。\n\n"
+    "然后空一行，输出以下各维度的详细分析：\n"
     "- **主要关注话题/领域**\n"
     "- **发言风格与情绪倾向**\n"
     "- **活跃规律与社交特征**\n"
     "- **性格特征与思维习惯**\n"
     "- **客观综合评价**\n\n"
     "**格式要求：**\n"
-    "- 直接输出分析结果，不要包含寒暄语或前言。\n"
-    "- 仅使用双星号加粗（即 **文字**）、换行和短横线 - 进行排版。\n"
+    "- 第一行的一句话总结必须以 💬 开头，不超过 50 个字。\n"
+    "- 详细分析部分使用双星号加粗（即 **文字**）、换行和短横线 - 进行排版。\n"
     "- 绝对不要使用 # 标题语法，因为 Telegram 无法渲染。\n"
     "- 不要使用编号列表（1. 2. 3.），统一使用 - 列表。"
 )
@@ -257,6 +263,39 @@ def _md_to_html(text: str) -> str:
     # `代码` → <code>代码</code>（单行内联代码）
     text = re.sub(r"`([^`]+?)`", r"<code>\1</code>", text)
     return text
+
+
+def _split_summary(summary: str) -> Tuple[str, str]:
+    """将 LLM 输出分离为一句话总结和详细分析。
+
+    LLM 被要求以 💬 开头输出一句话总结，后面空行再输出详细分析。
+    如果格式不符合预期，整体作为详细分析，一句话总结留空。
+
+    Returns:
+        (one_liner, detail) — one_liner 可能为空字符串
+    """
+    text = summary.strip()
+
+    # 查找以 💬 开头的行
+    if not text.startswith("💬"):
+        # 也可能 LLM 在 💬 前面加了换行
+        idx = text.find("💬")
+        if idx != -1 and idx < 100:
+            text = text[idx:]
+        else:
+            return "", summary.strip()
+
+    # 以第一个空行为界拆分
+    for sep in ("\n\n", "\n"):
+        pos = text.find(sep)
+        if pos != -1:
+            one_liner = text[:pos].strip()
+            detail = text[pos:].strip()
+            if detail:
+                return one_liner, detail
+    
+    # 没有找到分隔，整段就是一句话（极端情况）
+    return text.strip(), ""
 
 
 # ===================================================================
@@ -893,14 +932,19 @@ async def summarize_user(client: Client, message: Message) -> None:
     # 确定输出中显示的模型名称
     display_model = sqlite.get(DISPLAY_MODEL_KEY, model)
 
-    # 将 LLM 返回的 Markdown 转为 HTML
-    summary_html = _md_to_html(summary)
+    # 分离一句话总结和详细分析
+    one_liner, detail = _split_summary(summary)
 
-    # HTML 头部：用 blockquote 包裹元信息，视觉分层更清晰
+    # 分别转为 HTML
+    one_liner_html = _md_to_html(one_liner) if one_liner else ""
+    detail_html = _md_to_html(detail) if detail else _md_to_html(summary)
+
+    # HTML 转义动态内容
     dn_safe = display_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     gt_safe = group_title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     dm_safe = display_model.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+    # 组装输出：头部元信息 + 一句话总结 + 可折叠详细分析
     result_header = (
         f"<blockquote>"
         f"👤 <b>{dn_safe}</b> 的用户画像\n"
@@ -909,7 +953,17 @@ async def summarize_user(client: Client, message: Message) -> None:
         f"🤖 模型：<b>{dm_safe}</b>"
         f"</blockquote>\n"
     )
-    result_text = result_header + summary_html
+
+    # 一句话总结（直接展示）
+    summary_line = f"{one_liner_html}\n\n" if one_liner_html else ""
+
+    # 详细分析（折叠）
+    detail_block = (
+        f"<blockquote expandable>{detail_html}</blockquote>"
+        if detail_html else ""
+    )
+
+    result_text = result_header + summary_line + detail_block
 
     if is_remote:
         # 远程模式：分条发送完整结果到当前对话（通常是收藏夹）
