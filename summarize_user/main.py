@@ -187,51 +187,9 @@ _CONFIG_COMMANDS = {
 # ===================================================================
 
 
-def _safe_truncate(text: str, max_len: int = TG_MSG_CHAR_LIMIT) -> str:
-    """在段落或换行边界处智能截断文本，避免破坏格式标签。"""
-    if len(text) <= max_len:
-        return text
-
-    suffix = "\n\n…(内容过长，已截断)"
-    target = max_len - len(suffix)
-
-    cut = text.rfind("\n\n", 0, target)
-    if cut == -1:
-        cut = text.rfind("\n", 0, target)
-    if cut == -1:
-        cut = text.rfind(" ", 0, target)
-    if cut == -1:
-        cut = target
-
-    return text[:cut] + suffix
-
-
-def _split_message(text: str, max_len: int = TG_MSG_CHAR_LIMIT) -> List[str]:
-    """将长文本在段落边界处切分为多条消息。"""
-    if len(text) <= max_len:
-        return [text]
-
-    chunks = []
-    remaining = text
-
-    while remaining:
-        if len(remaining) <= max_len:
-            chunks.append(remaining)
-            break
-
-        # 在 max_len 范围内寻找最佳切分点
-        cut = remaining.rfind("\n\n", 0, max_len)
-        if cut == -1 or cut < max_len // 2:
-            cut = remaining.rfind("\n", 0, max_len)
-        if cut == -1 or cut < max_len // 2:
-            cut = remaining.rfind(" ", 0, max_len)
-        if cut == -1 or cut < max_len // 4:
-            cut = max_len
-
-        chunks.append(remaining[:cut].rstrip())
-        remaining = remaining[cut:].lstrip()
-
-    return [c for c in chunks if c]
+def _telegram_length(text: str) -> int:
+    """按 Telegram 使用的 UTF-16 code units 计算消息长度。"""
+    return len(text.encode("utf-16-le")) // 2
 
 
 def _mask_sensitive(value: str) -> str:
@@ -268,6 +226,93 @@ def _md_to_html(text: str) -> str:
     # `代码` → <code>代码</code>（单行内联代码）
     text = re.sub(r"`([^`]+?)`", r"<code>\1</code>", text)
     return text
+
+
+def _take_detail_chunk(markdown: str, max_units: int) -> Tuple[str, str]:
+    """取出一段能安全包裹为完整 blockquote 的 Markdown。"""
+    opening = "<blockquote expandable>"
+    closing = "</blockquote>"
+
+    def render(value: str) -> str:
+        return f"{opening}{_md_to_html(value)}{closing}"
+
+    if not markdown or _telegram_length(opening + closing) >= max_units:
+        return "", markdown
+    if _telegram_length(render(markdown)) <= max_units:
+        return render(markdown), ""
+
+    low, high = 1, len(markdown)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if _telegram_length(render(markdown[:mid].rstrip())) <= max_units:
+            low = mid
+        else:
+            high = mid - 1
+
+    max_chars = low
+    cut = markdown.rfind("\n\n", 0, max_chars + 1)
+    if cut < max_chars // 2:
+        cut = markdown.rfind("\n", 0, max_chars + 1)
+    if cut < max_chars // 2:
+        cut = markdown.rfind(" ", 0, max_chars + 1)
+    if cut < max_chars // 4:
+        cut = max_chars
+
+    current = markdown[:cut].rstrip()
+    remaining = markdown[cut:].lstrip()
+    return render(current), remaining
+
+
+def _build_result_messages(
+    header_html: str,
+    one_liner: str,
+    detail: str,
+    max_units: int = TG_MSG_CHAR_LIMIT,
+) -> List[str]:
+    """生成每条都满足长度限制且 HTML 标签完整的结果消息。"""
+    prefix = header_html
+    if one_liner:
+        prefix += f"{_md_to_html(one_liner)}\n\n"
+
+    if not detail:
+        return [prefix]
+
+    messages = []
+    remaining = detail
+    available = max_units - _telegram_length(prefix)
+    first_detail, remaining_after_first = _take_detail_chunk(remaining, available)
+    if first_detail:
+        messages.append(prefix + first_detail)
+        remaining = remaining_after_first
+    else:
+        messages.append(prefix)
+
+    while remaining:
+        detail_chunk, new_remaining = _take_detail_chunk(remaining, max_units)
+        if not detail_chunk or new_remaining == remaining:
+            raise ValueError("无法在 Telegram 消息长度限制内切分分析结果。")
+        messages.append(detail_chunk)
+        remaining = new_remaining
+
+    return messages
+
+
+def _build_local_result_message(
+    header_html: str,
+    one_liner: str,
+    detail: str,
+    max_units: int = TG_MSG_CHAR_LIMIT,
+) -> str:
+    """生成群内单条结果；过长时安全截断并保持 HTML 完整。"""
+    suffix = "\n\n…(内容过长，已截断)"
+    reserved_limit = max_units - _telegram_length(suffix)
+    messages = _build_result_messages(
+        header_html,
+        one_liner,
+        detail,
+        max_units=reserved_limit,
+    )
+    return messages[0] + (suffix if len(messages) > 1 else "")
 
 
 def _split_summary(summary: str) -> Tuple[str, str]:
@@ -321,25 +366,39 @@ def _parse_message_link(link: str) -> Tuple[Optional[object], Optional[int]]:
         chat_identifier 可能是 int（私密群组 ID）或 str（公开群组用户名）。
         解析失败时返回 (None, None)。
     """
-    # 私密群组链接: https://t.me/c/<chat_id>/<msg_id>
-    m = re.match(r"https?://t\.me/c/(\d+)/(\d+)", link)
-    if m:
-        # Telegram 内部 ID 需加 -100 前缀
-        chat_id = int(f"-100{m.group(1)}")
-        msg_id = int(m.group(2))
-        return chat_id, msg_id
+    parts = urlsplit(link.strip())
+    if parts.scheme not in ("http", "https") or parts.netloc.lower() not in (
+        "t.me",
+        "www.t.me",
+    ):
+        return None, None
 
-    # 公开群组链接: https://t.me/<username>/<msg_id>
-    m = re.match(r"https?://t\.me/([a-zA-Z_][a-zA-Z0-9_]{3,})/(\d+)", link)
-    if m:
-        username = m.group(1)
-        msg_id = int(m.group(2))
-        return username, msg_id
+    path_parts = [part for part in parts.path.split("/") if part]
+
+    # 私密群组：/c/<chat_id>/<msg_id>，Topic 链接会多一个 <topic_id>。
+    if len(path_parts) in (3, 4) and path_parts[0] == "c":
+        if path_parts[1].isdigit() and all(part.isdigit() for part in path_parts[2:]):
+            return int(f"-100{path_parts[1]}"), int(path_parts[-1])
+
+    # 公开群组：/<username>/<msg_id>，Topic 链接会多一个 <topic_id>。
+    if len(path_parts) in (2, 3):
+        username = path_parts[0]
+        if re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]{3,}", username) and all(
+            part.isdigit() for part in path_parts[1:]
+        ):
+            return username, int(path_parts[-1])
 
     return None, None
 
 
-def _extract_flags(args: list) -> Tuple[list, Optional[str], Optional[str]]:
+def _normalize_peer_identifier(value: object) -> object:
+    """将纯数字 Telegram ID 转为 int，保留用户名和链接字符串。"""
+    if isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
+        return int(value)
+    return value
+
+
+def _extract_flags(args: list) -> Tuple[list, Optional[object], Optional[str]]:
     """
     从参数列表中提取标志参数。
 
@@ -360,7 +419,7 @@ def _extract_flags(args: list) -> Tuple[list, Optional[str], Optional[str]]:
 
     while i < len(args):
         if args[i] in ("-g", "--group") and i + 1 < len(args):
-            group_id = args[i + 1]
+            group_id = _normalize_peer_identifier(args[i + 1])
             i += 2
         elif args[i] in ("-l", "--link") and i + 1 < len(args):
             msg_link = args[i + 1]
@@ -516,7 +575,7 @@ async def _resolve_target(
 
         if len(args) >= 2 and args[0].isdigit():
             limit = int(args[0])
-            user_arg = args[1]
+            user_arg = _normalize_peer_identifier(args[1])
         elif len(args) == 1 and args[0].isdigit():
             try:
                 target_user = await client.get_users(int(args[0]))
@@ -839,9 +898,12 @@ async def _map_reduce_summary(
         else:
             successful.append(f"**第 {i + 1} 段分析：**\n{result}")
 
-    if not successful:
-        first_error = _sanitize_error(failures[0]) if failures else "未知错误"
-        raise Exception(f"所有分块分析均失败。首个错误：{first_error}")
+    if failures:
+        first_error = _sanitize_error(failures[0])
+        raise Exception(
+            f"{len(failures)}/{total_chunks} 个分块分析失败，已停止生成不完整画像。"
+            f"首个错误：{first_error}"
+        )
 
     # --- Reduce 阶段：合并所有局部摘要 ---
     if progress_callback:
@@ -850,9 +912,10 @@ async def _map_reduce_summary(
         )
 
     combined_partials = "\n\n---\n\n".join(successful)
+    final_prompt = sqlite.get(PROMPT_KEY, REDUCE_SYSTEM_PROMPT)
     return await _call_llm(
         f"以下是对该用户 {len(successful)} 个时间段发言的局部分析结果：\n\n{combined_partials}",
-        REDUCE_SYSTEM_PROMPT,
+        final_prompt,
         api_key,
         base_url,
         model,
@@ -1043,10 +1106,6 @@ async def summarize_user(client: Client, message: Message) -> None:
     # 分离一句话总结和详细分析
     one_liner, detail = _split_summary(summary)
 
-    # 分别转为 HTML
-    one_liner_html = _md_to_html(one_liner) if one_liner else ""
-    detail_html = _md_to_html(detail) if detail else _md_to_html(summary)
-
     # HTML 转义动态内容
     dn_safe = display_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     gt_safe = group_title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -1062,27 +1121,17 @@ async def summarize_user(client: Client, message: Message) -> None:
         f"</blockquote>\n"
     )
 
-    # 一句话总结（直接展示）
-    summary_line = f"{one_liner_html}\n\n" if one_liner_html else ""
-
-    # 详细分析（折叠）
-    detail_block = (
-        f"<blockquote expandable>{detail_html}</blockquote>"
-        if detail_html else ""
-    )
-
-    result_text = result_header + summary_line + detail_block
-
     if is_remote:
-        # 远程模式：分条发送完整结果到当前对话（通常是收藏夹）
-        parts = _split_message(result_text)
+        # 远程模式：每条消息均独立满足长度限制且具有完整 HTML 标签。
+        parts = _build_result_messages(result_header, one_liner, detail)
         await message.edit(parts[0], parse_mode=ParseMode.HTML)
         for part in parts[1:]:
             await client.send_message(
                 message.chat.id, part, parse_mode=ParseMode.HTML
             )
     else:
-        # 群内模式：截断后编辑消息
+        # 群内模式：安全截断，确保不会留下未闭合的 HTML 标签。
         await message.edit(
-            _safe_truncate(result_text), parse_mode=ParseMode.HTML
+            _build_local_result_message(result_header, one_liner, detail),
+            parse_mode=ParseMode.HTML,
         )

@@ -202,6 +202,58 @@ class SummarizeUserHelpersTests(unittest.TestCase):
         self.assertNotIn("sk-test-secret", preview)
         self.assertIn("****", preview)
 
+    def test_topic_message_links_use_final_message_id(self):
+        parse = self.module._parse_message_link
+        self.assertEqual(
+            parse("https://t.me/c/1234567890/77/999?single"),
+            (-1001234567890, 999),
+        )
+        self.assertEqual(
+            parse("https://t.me/public_group/77/999"),
+            ("public_group", 999),
+        )
+        self.assertEqual(
+            parse("https://t.me/c/1234567890/999"),
+            (-1001234567890, 999),
+        )
+        self.assertEqual(parse("https://evil.example/c/123/999"), (None, None))
+
+    def test_numeric_group_identifier_is_converted_to_int(self):
+        clean, group_id, link = self.module._extract_flags(
+            ["-g", "-1001234567890", "200", "123456789"]
+        )
+        self.assertEqual(clean, ["200", "123456789"])
+        self.assertEqual(group_id, -1001234567890)
+        self.assertIsInstance(group_id, int)
+        self.assertIsNone(link)
+
+    def test_long_results_have_balanced_html_and_telegram_safe_lengths(self):
+        header = "<blockquote><b>header</b></blockquote>\n"
+        detail = "**分析**\n" + "😀" * 5000
+        messages = self.module._build_result_messages(header, "💬 总结", detail)
+
+        self.assertGreater(len(messages), 1)
+        for message in messages:
+            self.assertLessEqual(
+                self.module._telegram_length(message),
+                self.module.TG_MSG_CHAR_LIMIT,
+            )
+            self.assertEqual(message.count("<blockquote"), message.count("</blockquote>"))
+            self.assertEqual(message.count("<b>"), message.count("</b>"))
+
+        local_message = self.module._build_local_result_message(
+            header, "💬 总结", detail
+        )
+        self.assertLessEqual(
+            self.module._telegram_length(local_message),
+            self.module.TG_MSG_CHAR_LIMIT,
+        )
+        self.assertEqual(
+            local_message.count("<blockquote"),
+            local_message.count("</blockquote>"),
+        )
+        self.assertIn("内容过长，已截断", local_message)
+
 
 class SummarizeUserCallTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
@@ -314,6 +366,78 @@ class SummarizeUserCallTests(unittest.IsolatedAsyncioTestCase):
         finally:
             self.module._chunk_texts = original_chunk_texts
             self.module._call_llm = original_call_llm
+
+    async def test_partial_map_failure_stops_incomplete_report(self):
+        original_chunk_texts = self.module._chunk_texts
+        original_call_llm = self.module._call_llm
+        self.module._chunk_texts = lambda texts: ["chunk one", "chunk two"]
+        calls = []
+
+        async def mixed_call(text, *args, **kwargs):
+            calls.append(text)
+            if "第 2/2" in text:
+                raise Exception("second chunk failed")
+            return "first chunk result"
+
+        self.module._call_llm = mixed_call
+        try:
+            with self.assertRaisesRegex(Exception, "1/2 个分块分析失败"):
+                await self.module._map_reduce_summary(
+                    ["message"],
+                    "secret-api-key",
+                    "https://example.com/v1",
+                    "test-model",
+                )
+            self.assertEqual(len(calls), 2)
+        finally:
+            self.module._chunk_texts = original_chunk_texts
+            self.module._call_llm = original_call_llm
+
+    async def test_custom_prompt_is_used_for_multi_chunk_final_report(self):
+        original_chunk_texts = self.module._chunk_texts
+        original_call_llm = self.module._call_llm
+        self.module._chunk_texts = lambda texts: ["chunk one", "chunk two"]
+        system_prompts = []
+        self.module.sqlite[self.module.PROMPT_KEY] = "custom final prompt"
+
+        async def successful_call(text, system_prompt, *args, **kwargs):
+            system_prompts.append(system_prompt)
+            return "final" if "局部分析结果" in text else "partial"
+
+        self.module._call_llm = successful_call
+        try:
+            result = await self.module._map_reduce_summary(
+                ["message"],
+                "secret-api-key",
+                "https://example.com/v1",
+                "test-model",
+            )
+            self.assertEqual(result, "final")
+            self.assertEqual(system_prompts[-1], "custom final prompt")
+            self.assertEqual(system_prompts[:-1], [self.module.MAP_SYSTEM_PROMPT] * 2)
+        finally:
+            self.module.sqlite.pop(self.module.PROMPT_KEY, None)
+            self.module._chunk_texts = original_chunk_texts
+            self.module._call_llm = original_call_llm
+
+    async def test_count_and_numeric_user_id_passes_int_to_pyrogram(self):
+        calls = []
+
+        class Client:
+            async def get_users(self, value):
+                calls.append(value)
+                return types.SimpleNamespace(id=value, first_name="User")
+
+        message = types.SimpleNamespace(
+            reply_to_message=None,
+            edit=lambda *args, **kwargs: None,
+        )
+        target, limit = await self.module._resolve_target(
+            Client(), message, ["200", "123456789"], is_remote=True
+        )
+        self.assertEqual(limit, 200)
+        self.assertEqual(target.id, 123456789)
+        self.assertEqual(calls, [123456789])
 
 
 if __name__ == "__main__":

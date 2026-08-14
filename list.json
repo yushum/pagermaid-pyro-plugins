@@ -12,10 +12,10 @@
     },
     {
       "name": "summarize_user",
-      "version": "1.4",
+      "version": "1.5",
       "section": "chat",
       "maintainer": "yusum",
-      "size": "38.72 kb",
+      "size": "40.61 kb",
       "supported": true,
       "des_short": "用户画像生成插件",
       "des": "抓取指定用户在群组的发言，调用AI生成画像分析报告，支持零痕迹及分块分析。"
