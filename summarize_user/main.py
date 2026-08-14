@@ -29,9 +29,11 @@ summarize_user — PagerMaid-Pyro 插件
 """
 
 import asyncio
+import json
 import logging
 import re
 from typing import List, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from pyrogram.enums import ChatType, ParseMode
@@ -239,10 +241,13 @@ def _mask_sensitive(value: str) -> str:
     return f"{value[:4]}{'*' * (len(value) - 8)}{value[-4:]}"
 
 
-def _sanitize_error(error: Exception) -> str:
-    """过滤异常信息中可能包含的敏感内容。"""
+def _sanitize_error(error: object, api_key: Optional[str] = None) -> str:
+    """过滤错误或响应预览中可能包含的敏感内容。"""
     msg = str(error)
-    msg = re.sub(r"(sk-|Bearer\s+)\S+", r"\1****", msg)
+    if api_key:
+        msg = msg.replace(api_key, "****")
+    msg = re.sub(r"(?i)(Bearer\s+)\S+", r"\1****", msg)
+    msg = re.sub(r"\bsk-[A-Za-z0-9_-]+", "sk-****", msg)
     return msg
 
 
@@ -619,6 +624,95 @@ def _chunk_texts(texts: List[str], chunk_max_chars: int = CHUNK_MAX_CHARS) -> Li
 # ===================================================================
 
 
+def _build_chat_completions_url(base_url: str) -> str:
+    """由 API 基础地址或完整端点构建 Chat Completions 地址。"""
+    clean_url = base_url.strip()
+    parts = urlsplit(clean_url)
+    path = parts.path.rstrip("/")
+    if not path.endswith("/chat/completions"):
+        path += "/chat/completions"
+    return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
+
+
+def _response_preview(
+    value: object,
+    api_key: Optional[str] = None,
+    max_chars: int = 300,
+) -> str:
+    """生成适合直接展示的、截断且脱敏的响应预览。"""
+    if isinstance(value, (dict, list)):
+        try:
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            text = str(value)
+    else:
+        text = str(value or "")
+
+    text = _sanitize_error(text, api_key).replace("\x00", "")
+    if not text:
+        return "<空响应>"
+    return text[:max_chars] + ("…" if len(text) > max_chars else "")
+
+
+def _extract_api_error(data: object) -> Optional[str]:
+    """提取 HTTP 200 响应中常见的 OpenAI 风格错误。"""
+    if not isinstance(data, dict) or "error" not in data:
+        return None
+
+    error = data["error"]
+    if isinstance(error, str):
+        return error.strip() or None
+    if not isinstance(error, dict):
+        return None
+
+    message = error.get("message")
+    details = [str(error[key]) for key in ("type", "code") if error.get(key)]
+    if message:
+        suffix = f" ({'/'.join(details)})" if details else ""
+        return f"{message}{suffix}"
+    return _response_preview(error)
+
+
+def _extract_content(data: object) -> Optional[str]:
+    """从 OpenAI Chat Completions 兼容响应中提取最终文本。"""
+    if not isinstance(data, dict):
+        return None
+
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        return None
+
+    message = first_choice.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip() or None
+        if isinstance(content, list):
+            texts = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if item.get("type") in ("text", "output_text") and isinstance(
+                    text, str
+                ):
+                    if text.strip():
+                        texts.append(text.strip())
+            if texts:
+                return "\n".join(texts)
+
+    # 少数兼容网关会在 Chat Completions 端点返回 legacy choice.text。
+    legacy_text = first_choice.get("text")
+    if isinstance(legacy_text, str) and legacy_text.strip():
+        return legacy_text.strip()
+
+    return None
+
+
 async def _call_llm(
     text: str,
     system_prompt: str,
@@ -639,9 +733,7 @@ async def _call_llm(
         ],
     }
 
-    if not base_url.endswith("/"):
-        base_url += "/"
-    endpoint = f"{base_url}chat/completions"
+    endpoint = _build_chat_completions_url(base_url)
 
     async with _api_semaphore:
         try:
@@ -650,34 +742,38 @@ async def _call_llm(
         except httpx.TimeoutException:
             raise Exception("API 请求超时，请检查网络连接或稍后重试。")
         except httpx.HTTPStatusError as e:
-            body_preview = (e.response.text or "")[:200]
+            body_preview = _response_preview(e.response.text, api_key)
             raise Exception(
-                f"API 返回错误状态码 {e.response.status_code}：{body_preview}"
+                f"API 返回 HTTP {e.response.status_code}。\n"
+                f"实际响应预览：{body_preview}"
             )
-        except Exception as e:
-            raise Exception(f"API 请求失败：{_sanitize_error(e)}")
+        except httpx.RequestError as e:
+            raise Exception(f"API 请求失败：{_sanitize_error(e, api_key)}")
 
     try:
         data = response.json()
-    except Exception:
-        raise Exception("API 返回了无法解析的响应格式。")
-
-    try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        # 将响应预览展示给用户以便排查
-        preview = str(data)[:300]
-        log.error("API 响应结构异常: %s", str(data)[:500])
+    except ValueError:
+        preview = _response_preview(response.text, api_key)
         raise Exception(
-            f"API 返回了意外的响应结构。\n\n"
-            f"期望的格式：choices[0].message.content\n"
+            "API 返回了无法解析的非 JSON 响应。\n"
             f"实际响应预览：{preview}"
         )
 
-    if not content or not content.strip():
-        raise Exception("API 返回了空内容，请稍后重试或更换模型。")
+    api_error = _extract_api_error(data)
+    if api_error:
+        raise Exception(f"API 返回错误：{_sanitize_error(api_error, api_key)}")
 
-    return content.strip()
+    content = _extract_content(data)
+
+    if content is None:
+        preview = _response_preview(data, api_key)
+        log.error("API 响应结构异常: %s", preview)
+        raise Exception(
+            "API 返回了无法识别的 OpenAI 兼容响应结构。\n"
+            f"实际响应预览：{preview}"
+        )
+
+    return content
 
 
 async def _map_reduce_summary(
@@ -735,14 +831,17 @@ async def _map_reduce_summary(
 
     # 收集成功的局部摘要，记录失败的
     successful = []
+    failures = []
     for i, result in enumerate(partial_summaries):
         if isinstance(result, Exception):
             log.warning("第 %d/%d 块分析失败: %s", i + 1, total_chunks, result)
+            failures.append(result)
         else:
             successful.append(f"**第 {i + 1} 段分析：**\n{result}")
 
     if not successful:
-        raise Exception("所有分块分析均失败，请检查 API 配置或稍后重试。")
+        first_error = _sanitize_error(failures[0]) if failures else "未知错误"
+        raise Exception(f"所有分块分析均失败。首个错误：{first_error}")
 
     # --- Reduce 阶段：合并所有局部摘要 ---
     if progress_callback:
@@ -932,7 +1031,10 @@ async def summarize_user(client: Client, message: Message) -> None:
             texts, api_key, base_url, model, progress_callback=_progress
         )
     except Exception as e:
-        return await message.edit(f"❌ {_sanitize_error(e)}")
+        return await message.edit(
+            f"❌ {_sanitize_error(e, api_key)}",
+            parse_mode=ParseMode.DISABLED,
+        )
 
     # ---- 8. 输出结果 ----
     # 确定输出中显示的模型名称
