@@ -43,7 +43,13 @@ def load_plugin():
     enums.Client = object
     enums.Message = object
     listener_module = types.ModuleType("pagermaid.listener")
-    listener_module.listener = lambda *args, **kwargs: lambda func: func
+    registered_commands = []
+
+    def fake_listener(*args, **kwargs):
+        registered_commands.append(kwargs.get("command"))
+        return lambda func: func
+
+    listener_module.listener = fake_listener
 
     modules = {
         "httpx": httpx,
@@ -62,6 +68,7 @@ def load_plugin():
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
+        module._test_registered_commands = registered_commands
         return module
     finally:
         for name, value in old.items():
@@ -72,7 +79,9 @@ def load_plugin():
 
 
 class FakeMessage:
-    def __init__(self, message_id, date, text, user_id, name, reply_to=None):
+    def __init__(
+        self, message_id, date, text, user_id, name, reply_to=None, topic_id=None
+    ):
         self.id = message_id
         self.date = date
         self.text = text
@@ -82,6 +91,7 @@ class FakeMessage:
         )
         self.sender_chat = None
         self.reply_to_message_id = reply_to
+        self.reply_to_top_message_id = topic_id
         self.empty = False
 
 
@@ -89,10 +99,15 @@ class FakeHistoryClient:
     def __init__(self, messages):
         self.messages = {message.id: message for message in messages}
 
-    async def get_messages(self, chat_id, ids):
+    async def get_messages(self, chat_id, ids, replies=0):
         if not isinstance(ids, list):
             return self.messages.get(ids)
         return [self.messages[mid] for mid in ids if mid in self.messages]
+
+    async def search_messages(self, chat_id, from_user, limit=0):
+        for message in sorted(self.messages.values(), key=lambda item: item.id, reverse=True):
+            if message.from_user.id == from_user:
+                yield message
 
 
 class ConflictAnalyzerTests(unittest.TestCase):
@@ -105,21 +120,32 @@ class ConflictAnalyzerTests(unittest.TestCase):
         asyncio.run(cls.module._http_client.aclose())
 
     def test_parse_count_duration_and_topic_link(self):
-        spec, link = self.module._parse_args(["-l", "https://t.me/c/123/7/99", "30m"])
+        spec, link, users = self.module._parse_args(
+            ["-l", "https://t.me/c/123/7/99", "30m", "-u", "@A,@B"]
+        )
         self.assertIsNone(spec.count)
         self.assertEqual(spec.seconds, 1800)
         self.assertEqual(link, "https://t.me/c/123/7/99")
+        self.assertEqual(users, ["@A", "@B"])
         self.assertEqual(
             self.module._parse_message_link(link),
-            (-100123, 99),
+            (-100123, 99, 7),
         )
 
-        spec, _ = self.module._parse_args(["250"])
+        spec, _, _ = self.module._parse_args(["250"])
         self.assertEqual(spec.count, 250)
+        spec, _, _ = self.module._parse_args(["30d"])
+        self.assertEqual(spec.seconds, 30 * 86400)
         with self.assertRaises(ValueError):
             self.module._parse_args(["10"])
         with self.assertRaises(ValueError):
             self.module._parse_args(["3x"])
+        with self.assertRaises(ValueError):
+            self.module._parse_args(["31d"])
+
+    def test_registers_short_and_plugin_name_help_commands(self):
+        self.assertIn("conflict", self.module._test_registered_commands)
+        self.assertIn("conflict_analyzer", self.module._test_registered_commands)
 
     def test_selection_supports_multiple_users_without_reply_edges(self):
         now = datetime(2026, 1, 1, 12, 0)
@@ -217,10 +243,12 @@ class ConflictWindowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([record.message_id for record in records], [99, 100, 101])
 
-    async def test_includes_replied_message_outside_candidate_window(self):
+    async def test_recursively_includes_reply_islands_and_their_neighbors(self):
         now = datetime(2026, 1, 1, 12, 0)
         messages = [
-            FakeMessage(10, now - timedelta(hours=1), "earlier claim", 1, "A"),
+            FakeMessage(5, now - timedelta(days=2), "original claim", 1, "A"),
+            FakeMessage(9, now - timedelta(hours=1, minutes=1), "nearby context", 3, "C"),
+            FakeMessage(10, now - timedelta(hours=1), "earlier claim", 1, "A", reply_to=5),
             FakeMessage(100, now, "anchor", 2, "B", reply_to=10),
             FakeMessage(101, now + timedelta(seconds=1), "follow-up", 1, "A"),
         ]
@@ -229,10 +257,65 @@ class ConflictWindowTests(unittest.IsolatedAsyncioTestCase):
             self.module._message_to_record(client.messages[100]),
             self.module._message_to_record(client.messages[101]),
         ]
-        records = await self.module._include_reply_context(client, -1001, records)
-        self.assertEqual([record.message_id for record in records], [10, 100, 101])
-        self.assertTrue(records[0].context_only)
-        self.assertIn("[引用上下文]", self.module._format_records(records, 100))
+        records, truncated = await self.module._expand_reply_context(
+            client,
+            -1001,
+            records,
+            now,
+            7 * 86400,
+        )
+        self.assertEqual(
+            [record.message_id for record in records], [5, 9, 10, 100, 101]
+        )
+        self.assertTrue(next(item for item in records if item.message_id == 5).context_only)
+        rendered = self.module._format_records(records, 100)
+        self.assertIn("[回复链节点]", rendered)
+        self.assertIn("[上下文岛]", rendered)
+        self.assertFalse(truncated)
+
+    async def test_topic_window_excludes_adjacent_other_topic(self):
+        now = datetime(2026, 1, 1, 12, 0)
+        messages = [
+            FakeMessage(99, now, "same topic", 1, "A", topic_id=50),
+            FakeMessage(100, now, "anchor", 2, "B", topic_id=50),
+            FakeMessage(101, now, "other topic", 3, "C", topic_id=60),
+            FakeMessage(102, now, "same topic later", 1, "A", topic_id=50),
+        ]
+        client = FakeHistoryClient(messages)
+        records, _ = await self.module._fetch_candidate_window(
+            client,
+            -1001,
+            client.messages[100],
+            self.module.WindowSpec(count=20),
+            topic_id=50,
+        )
+        self.assertEqual([item.message_id for item in records], [99, 100, 102])
+
+    async def test_participant_search_finds_non_reply_messages_across_days(self):
+        now = datetime(2026, 1, 10, 12, 0)
+        messages = [
+            FakeMessage(10, now - timedelta(days=5), "old direct statement", 1, "A"),
+            FakeMessage(11, now - timedelta(days=5) + timedelta(seconds=5), "joined in", 3, "C"),
+            FakeMessage(100, now, "anchor", 2, "B"),
+        ]
+        client = FakeHistoryClient(messages)
+        records = await self.module._fetch_participant_messages(
+            client,
+            -1001,
+            {1},
+            now,
+            7 * 86400,
+        )
+        self.assertEqual([item.message_id for item in records], [10, 11])
+        self.assertEqual(records[0].context_kind, "参与者补搜")
+        self.assertEqual(records[1].context_kind, "补搜上下文")
+
+    async def test_non_text_media_is_kept_as_missing_content_marker(self):
+        now = datetime(2026, 1, 1, 12, 0)
+        message = FakeMessage(100, now, None, 1, "A")
+        message.voice = object()
+        record = self.module._message_to_record(message)
+        self.assertEqual(record.text, "[语音消息，未转写]")
 
 
 if __name__ == "__main__":
