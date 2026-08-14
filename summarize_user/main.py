@@ -665,8 +665,14 @@ async def _call_llm(
     try:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
+        # 将响应预览展示给用户以便排查
+        preview = str(data)[:300]
         log.error("API 响应结构异常: %s", str(data)[:500])
-        raise Exception("API 返回了意外的响应结构，请检查模型和 API 地址配置。")
+        raise Exception(
+            f"API 返回了意外的响应结构。\n\n"
+            f"期望的格式：choices[0].message.content\n"
+            f"实际响应预览：{preview}"
+        )
 
     if not content or not content.strip():
         raise Exception("API 返回了空内容，请稍后重试或更换模型。")
