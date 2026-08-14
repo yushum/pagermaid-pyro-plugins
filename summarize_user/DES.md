@@ -15,6 +15,7 @@ PagerMaid-Pyro 用户画像分析插件
 - `,summarize_user setapi <API_KEY>` — 设置 API 密钥
 - `,summarize_user seturl <BASE_URL>` — 设置自定义 API 地址
 - `,summarize_user setmodel <MODEL>` — 设置模型名称
+- `,summarize_user setdisplay <NAME>` — 设置输出显示的模型名称
 - `,summarize_user setprompt <PROMPT>` — 自定义系统提示词
 - `,summarize_user showconfig` — 查看当前配置
 

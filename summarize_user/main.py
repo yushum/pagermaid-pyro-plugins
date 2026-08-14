@@ -22,6 +22,7 @@ summarize_user — PagerMaid-Pyro 插件
     ,summarize_user setapi <API_KEY>     — 设置 API 密钥
     ,summarize_user seturl <BASE_URL>    — 设置 API 地址
     ,summarize_user setmodel <MODEL>     — 设置模型名称
+    ,summarize_user setdisplay <NAME>    — 设置输出显示的模型名称
     ,summarize_user setprompt <PROMPT>   — 自定义 System Prompt
     ,summarize_user resetprompt          — 恢复默认 System Prompt
     ,summarize_user showconfig           — 查看当前配置
@@ -33,7 +34,7 @@ import re
 from typing import List, Optional, Tuple
 
 import httpx
-from pyrogram.enums import ChatType
+from pyrogram.enums import ChatType, ParseMode
 
 from pagermaid.listener import listener
 from pagermaid.enums import Client, Message
@@ -51,6 +52,7 @@ API_KEY_KEY = "summarize_user_api_key"
 BASE_URL_KEY = "summarize_user_base_url"
 MODEL_KEY = "summarize_user_model"
 PROMPT_KEY = "summarize_user_prompt"
+DISPLAY_MODEL_KEY = "summarize_user_display_model"
 
 # ---------------------------------------------------------------------------
 # 默认值与限制常量
@@ -69,45 +71,62 @@ MAX_CONCURRENT_REQUESTS = 3    # 并发 API 请求上限
 # Prompts
 # ---------------------------------------------------------------------------
 DEFAULT_SYSTEM_PROMPT = (
-    "你是一个专业的心理画像和言论分析专家。请根据用户在群组/对话中的发言历史，"
-    "对该用户进行全面、客观的总结画像。\n\n"
-    "**非常重要的要求：**\n"
-    "1. **客观真实**：必须基于用户实际发送过的文本进行客观、公正、严谨的分析与总结。\n"
-    "2. **零美化零偏见**：严禁任何讨好、夸大、美化或故意抹黑的情感偏向，保持绝对中立。\n"
-    "3. **结构化输出**：总结需包含以下维度：\n"
-    "   - **主要关注话题/领域**：用户经常讨论什么内容，核心兴趣点。\n"
-    "   - **发言风格与情绪倾向**：语言风格如何，情绪是平静、激动、阴阳怪气还是其他。\n"
-    "   - **性格特征与逻辑习惯**：体现出的性格特点，表达逻辑是否清晰，有无特定的交流习惯。\n"
-    "   - **客观综合评价**：直白、客观、真实的综合评价。\n\n"
-    "请直接输出分析结果，不要包含多余的寒暄语。\n"
-    "**注意格式限制：** 请务必仅使用 `**加粗**`、换行和 `-` 来进行排版。"
-    "**绝对不要**使用 `#`、`##`、`###` 等 Markdown 标题语法，因为 Telegram 无法正确渲染它们。"
+    "你是一个专业的用户画像与言论分析专家。"
+    "你将收到某用户在群组中的发言记录，每条格式为 [时间] 内容。\n"
+    "请基于这些发言对该用户进行全面、客观的总结画像。\n\n"
+    "**核心原则：**\n"
+    "1. **客观真实**：严格基于用户实际发言内容分析，不得凭空推测。\n"
+    "2. **零美化零偏见**：严禁任何讨好、夸大、美化或抹黑倾向，保持绝对中立。\n\n"
+    "**输出结构（请严格按以下维度组织）：**\n"
+    "- **主要关注话题/领域**：用户经常讨论什么内容，核心兴趣点是什么。\n"
+    "- **发言风格与情绪倾向**：语言风格特征（如正式/口语化、简洁/啰嗦），"
+    "整体情绪基调（如平和、激动、讽刺、消极等）。\n"
+    "- **活跃规律与社交特征**：根据时间戳分析活跃时段、发言频率，"
+    "以及与他人的互动模式（如主动发起讨论、回应他人、还是自说自话）。\n"
+    "- **性格特征与思维习惯**：体现出的性格特点，表达逻辑是否清晰，"
+    "有无特定的口头禅或交流习惯。\n"
+    "- **客观综合评价**：一段直白、客观、真实的综合评价。\n\n"
+    "**格式要求：**\n"
+    "- 直接输出分析结果，不要包含寒暄语或前言。\n"
+    "- 仅使用双星号加粗（即 **文字**）、换行和短横线 - 进行排版。\n"
+    "- 绝对不要使用 # 标题语法，因为 Telegram 无法渲染。\n"
+    "- 不要使用编号列表（1. 2. 3.），统一使用 - 列表。"
 )
 
 MAP_SYSTEM_PROMPT = (
-    "你是一个发言分析助手。你将收到某用户的一段发言记录片段。\n"
-    "请对这段发言进行要点提炼，输出该段的：\n"
-    "- 主要话题和关键词\n"
+    "你是一个发言分析助手。你将收到某用户的一段发言记录片段，"
+    "每条格式为 [时间] 内容。\n"
+    "请对这段发言进行客观、精炼的要点提炼，包括：\n"
+    "- 主要讨论话题和关键词\n"
     "- 发言风格和情绪特征\n"
-    "- 值得注意的观点或行为模式\n\n"
-    "保持客观、精炼，不超过 500 字。不要使用 Markdown 标题语法。"
+    "- 活跃时段和发言频率特征\n"
+    "- 值得注意的观点、立场或行为模式\n\n"
+    "**要求：**\n"
+    "- 保持客观中立，不做价值判断，只提炼事实特征。\n"
+    "- 根据实际内容密度灵活调整篇幅，但不超过 600 字。\n"
+    "- 不要使用 # 标题语法，仅用双星号加粗和短横线 - 排版。"
 )
 
 REDUCE_SYSTEM_PROMPT = (
-    "你是一个专业的心理画像和言论分析专家。"
+    "你是一个专业的用户画像与言论分析专家。"
     "以下是对某用户不同时间段发言的多段局部分析结果。\n"
-    "请将这些局部分析综合为一份完整、连贯的用户画像报告。\n\n"
-    "**要求：**\n"
-    "1. **客观真实**：综合各段分析，提炼出一致的特征，而非简单罗列。\n"
-    "2. **零美化零偏见**：保持绝对中立。\n"
-    "3. **结构化输出**：\n"
-    "   - **主要关注话题/领域**\n"
-    "   - **发言风格与情绪倾向**\n"
-    "   - **性格特征与逻辑习惯**\n"
-    "   - **客观综合评价**\n\n"
-    "请直接输出分析结果，不要包含多余的寒暄语。\n"
-    "**注意格式限制：** 请务必仅使用 `**加粗**`、换行和 `-` 来进行排版。"
-    "**绝对不要**使用 `#`、`##`、`###` 等 Markdown 标题语法。"
+    "请将这些局部分析综合为一份完整、连贯、有深度的用户画像报告。\n\n"
+    "**核心要求：**\n"
+    "- **综合提炼**：提取各段分析中一致的特征，归纳为统一结论，而非简单罗列或拼接。\n"
+    "- **关注变化**：如果不同时间段的分析之间存在矛盾或变化趋势，"
+    "请指出并分析可能的原因（如兴趣转移、情绪波动等）。\n"
+    "- **客观中立**：保持绝对中立，不美化不抹黑。\n\n"
+    "**输出结构：**\n"
+    "- **主要关注话题/领域**\n"
+    "- **发言风格与情绪倾向**\n"
+    "- **活跃规律与社交特征**\n"
+    "- **性格特征与思维习惯**\n"
+    "- **客观综合评价**\n\n"
+    "**格式要求：**\n"
+    "- 直接输出分析结果，不要包含寒暄语或前言。\n"
+    "- 仅使用双星号加粗（即 **文字**）、换行和短横线 - 进行排版。\n"
+    "- 绝对不要使用 # 标题语法，因为 Telegram 无法渲染。\n"
+    "- 不要使用编号列表（1. 2. 3.），统一使用 - 列表。"
 )
 
 # ---------------------------------------------------------------------------
@@ -140,6 +159,12 @@ _CONFIG_COMMANDS = {
         "label": "MODEL",
         "sensitive": False,
     },
+    "setdisplay": {
+        "key": DISPLAY_MODEL_KEY,
+        "label": "DISPLAY_MODEL",
+        "sensitive": False,
+        "join_args": True,
+    },
     "setprompt": {
         "key": PROMPT_KEY,
         "label": "自定义 System Prompt",
@@ -155,7 +180,7 @@ _CONFIG_COMMANDS = {
 
 
 def _safe_truncate(text: str, max_len: int = TG_MSG_CHAR_LIMIT) -> str:
-    """在段落或换行边界处智能截断文本，避免破坏 Markdown 格式。"""
+    """在段落或换行边界处智能截断文本，避免破坏格式标签。"""
     if len(text) <= max_len:
         return text
 
@@ -213,6 +238,25 @@ def _sanitize_error(error: Exception) -> str:
     msg = str(error)
     msg = re.sub(r"(sk-|Bearer\s+)\S+", r"\1****", msg)
     return msg
+
+
+def _md_to_html(text: str) -> str:
+    """将 LLM 返回的 Markdown 格式文本转换为 Telegram HTML 格式。
+
+    处理规则：
+    1. 转义 HTML 特殊字符（&, <, >）
+    2. **加粗** → <b>加粗</b>
+    3. `代码` → <code>代码</code>
+    """
+    # 先转义 HTML 特殊字符
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+    # **加粗** → <b>加粗</b>
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    # `代码` → <code>代码</code>（单行内联代码）
+    text = re.sub(r"`([^`]+?)`", r"<code>\1</code>", text)
+    return text
 
 
 # ===================================================================
@@ -319,11 +363,13 @@ async def _handle_config(args: list, message: Message) -> Optional[bool]:
         model = sqlite.get(MODEL_KEY, DEFAULT_MODEL)
         has_custom_prompt = PROMPT_KEY in sqlite
 
+        display_model = sqlite.get(DISPLAY_MODEL_KEY)
         lines = [
             "⚙️ **当前配置**\n",
             f"- **API_KEY**: {_mask_sensitive(api_key) if api_key else '❌ 未设置'}",
             f"- **BASE_URL**: `{base_url}`",
             f"- **MODEL**: `{model}`",
+            f"- **显示名称**: `{display_model}`" if display_model else "- **显示名称**: 📝 默认（与 MODEL 相同）",
             f"- **System Prompt**: {'✅ 自定义' if has_custom_prompt else '📝 默认'}",
         ]
         await message.edit("\n".join(lines))
@@ -686,9 +732,9 @@ async def _map_reduce_summary(
         "群内分析：\n"
         "  ,summarize_user [数量] [用户]\n\n"
         "工具：getid\n"
-        "配置：setapi / seturl / setmodel / setprompt / resetprompt / showconfig"
+        "配置：setapi / seturl / setmodel / setdisplay / setprompt / resetprompt / showconfig"
     ),
-    parameters="[-l <链接>] [-g <群组>] [数量] [用户] / getid / setapi / showconfig",
+    parameters="[-l <链接>] [-g <群组>] [数量] [用户] / getid / setapi / setdisplay / showconfig",
 )
 async def summarize_user(client: Client, message: Message) -> None:
     args = message.parameter or []
@@ -844,19 +890,37 @@ async def summarize_user(client: Client, message: Message) -> None:
         return await message.edit(f"❌ {_sanitize_error(e)}")
 
     # ---- 8. 输出结果 ----
+    # 确定输出中显示的模型名称
+    display_model = sqlite.get(DISPLAY_MODEL_KEY, model)
+
+    # 将 LLM 返回的 Markdown 转为 HTML
+    summary_html = _md_to_html(summary)
+
+    # HTML 头部：用 blockquote 包裹元信息，视觉分层更清晰
+    dn_safe = display_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    gt_safe = group_title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    dm_safe = display_model.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
     result_header = (
-        f"👤 **{display_name} 的用户画像**\n"
-        f"📍 群组：**{group_title}**\n"
-        f"📊 基于最近 **{len(texts)}** 条发言\n\n"
+        f"<blockquote>"
+        f"👤 <b>{dn_safe}</b> 的用户画像\n"
+        f"📍 群组：<b>{gt_safe}</b>\n"
+        f"📊 基于最近 <b>{len(texts)}</b> 条发言\n"
+        f"🤖 模型：<b>{dm_safe}</b>"
+        f"</blockquote>\n"
     )
-    result_text = result_header + summary
+    result_text = result_header + summary_html
 
     if is_remote:
         # 远程模式：分条发送完整结果到当前对话（通常是收藏夹）
         parts = _split_message(result_text)
-        await message.edit(parts[0])
+        await message.edit(parts[0], parse_mode=ParseMode.HTML)
         for part in parts[1:]:
-            await client.send_message(message.chat.id, part)
+            await client.send_message(
+                message.chat.id, part, parse_mode=ParseMode.HTML
+            )
     else:
         # 群内模式：截断后编辑消息
-        await message.edit(_safe_truncate(result_text))
+        await message.edit(
+            _safe_truncate(result_text), parse_mode=ParseMode.HTML
+        )
