@@ -30,7 +30,15 @@ def load_plugin():
     enums = types.ModuleType("pagermaid.enums")
     enums.Message = object
     listener_module = types.ModuleType("pagermaid.listener")
-    listener_module.listener = lambda *args, **kwargs: lambda func: func
+    registered_listeners = []
+
+    def fake_listener(*args, **kwargs):
+        def decorator(func):
+            registered_listeners.append((func.__name__, kwargs))
+            return func
+        return decorator
+
+    listener_module.listener = fake_listener
     utils = types.ModuleType("pagermaid.utils")
     utils.alias_command = lambda command: command
     utils.logs = types.SimpleNamespace(
@@ -56,6 +64,7 @@ def load_plugin():
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
+        module._test_registered_listeners = registered_listeners
         return module, sqlite
     finally:
         for name, old_module in old_modules.items():
@@ -124,6 +133,17 @@ class AutoDeleteSchedulerTests(unittest.TestCase):
         self.assertEqual(client.calls, [(-1, [1, 2]), (-1, [1]), (-1, [2])])
         self.assertNotIn(module._job_key(-1, 1), sqlite)
         self.assertNotIn(module._job_key(-1, 2), sqlite)
+
+
+    def test_listener_handles_forwarded_and_via_bot_messages(self):
+        module, _ = load_plugin()
+        listeners_dict = dict(module._test_registered_listeners)
+        self.assertIn("auto_del_task", listeners_dict)
+        task_kwargs = listeners_dict["auto_del_task"]
+        self.assertFalse(task_kwargs.get("incoming", True))
+        self.assertTrue(task_kwargs.get("outgoing", False))
+        self.assertFalse(task_kwargs.get("ignore_forwarded", True))
+        self.assertFalse(task_kwargs.get("ignore_via_bot", True))
 
 
 if __name__ == "__main__":

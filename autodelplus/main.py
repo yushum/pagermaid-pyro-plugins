@@ -821,7 +821,7 @@ async def auto_del(message: Message):
         await message.edit(f"❌ 设置失败: {e}")
 
 
-@listener(incoming=False, outgoing=True)
+@listener(incoming=False, outgoing=True, ignore_forwarded=False, ignore_via_bot=False)
 async def auto_del_task(message: Message):
     if not message.chat:
         return
