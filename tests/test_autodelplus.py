@@ -39,6 +39,20 @@ def load_plugin():
         return decorator
 
     listener_module.listener = fake_listener
+    hook_module = types.ModuleType("pagermaid.hook")
+    registered_hooks = {}
+
+    def hook(event):
+        def decorator(func):
+            registered_hooks[event] = func
+            return func
+        return decorator
+
+    hook_module.Hook = types.SimpleNamespace(
+        load_success=lambda: hook("load_success"),
+        reload_preprocessor=lambda: hook("reload_preprocessor"),
+        on_shutdown=lambda: hook("on_shutdown"),
+    )
     utils = types.ModuleType("pagermaid.utils")
     utils.alias_command = lambda command: command
     utils.logs = types.SimpleNamespace(
@@ -54,6 +68,7 @@ def load_plugin():
         "pagermaid.services": services,
         "pagermaid.enums": enums,
         "pagermaid.listener": listener_module,
+        "pagermaid.hook": hook_module,
         "pagermaid.utils": utils,
     }
     old_modules = {name: sys.modules.get(name) for name in modules}
@@ -65,6 +80,7 @@ def load_plugin():
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         module._test_registered_listeners = registered_listeners
+        module._test_registered_hooks = registered_hooks
         return module, sqlite
     finally:
         for name, old_module in old_modules.items():
@@ -75,6 +91,46 @@ def load_plugin():
 
 
 class AutoDeleteSchedulerTests(unittest.TestCase):
+    def test_load_recovers_jobs_without_messages_and_reload_stops_old_worker(self):
+        module, sqlite = load_plugin()
+
+        async def check():
+            deleted = asyncio.Event()
+            calls = []
+
+            class Client:
+                async def delete_messages(self, cid, mids):
+                    calls.append((cid, mids))
+                    deleted.set()
+
+            module.bot = Client()
+            key = module._job_key(-1, 42)
+            sqlite[key] = module.DeleteJob(0, -1, 42, "chat").to_dict()
+            hooks = module._test_registered_hooks
+            try:
+                await hooks["load_success"]()
+                old_worker = module.scheduler.worker_task
+                await hooks["load_success"]()
+                self.assertIs(module.scheduler.worker_task, old_worker)
+                await asyncio.wait_for(deleted.wait(), timeout=2)
+                self.assertEqual(calls, [(-1, [42])])
+                self.assertNotIn(key, sqlite)
+
+                future = module.DeleteJob(int(module.time.time()) + 3600, -1, 43, "chat")
+                module.scheduler.add_job(future)
+                await hooks["reload_preprocessor"]()
+                self.assertTrue(old_worker.cancelled())
+                self.assertIn(module._job_key(-1, 43), sqlite)
+                # 热重载创建新调度器，旧 worker 必须已经停止。
+                module.scheduler = module.AutoDeleteScheduler()
+                await hooks["load_success"]()
+                self.assertIsNot(module.scheduler.worker_task, old_worker)
+            finally:
+                await hooks["on_shutdown"]()
+            self.assertTrue(module.scheduler.worker_task.cancelled())
+
+        asyncio.run(check())
+
     def test_queue_does_not_silently_drop_jobs_after_5000(self):
         module, _ = load_plugin()
         scheduler = module.AutoDeleteScheduler()

@@ -31,6 +31,7 @@ from pyrogram.errors import FloodWait
 from pagermaid.services import bot, sqlite
 from pagermaid.enums import Message
 from pagermaid.listener import listener
+from pagermaid.hook import Hook
 from pagermaid.utils import alias_command, logs
 
 
@@ -565,6 +566,22 @@ class AutoDeleteScheduler:
 
 
 scheduler = AutoDeleteScheduler()
+
+
+@Hook.load_success()
+async def start_autodel_scheduler():
+    # 首次启动和插件热重载均触发，不依赖下一条发出的消息。
+    scheduler.ensure_worker(bot)
+
+
+@Hook.reload_preprocessor()
+@Hook.on_shutdown()
+async def stop_autodel_scheduler():
+    task = scheduler.worker_task
+    if task is not None and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 def _clear_all() -> Tuple[int, int]:
