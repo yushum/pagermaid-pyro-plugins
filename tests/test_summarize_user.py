@@ -55,10 +55,10 @@ class FakeResponse:
 
 class StubAsyncClient:
     def __init__(self, *args, **kwargs):
-        pass
+        self.closed = False
 
     async def aclose(self):
-        pass
+        self.closed = True
 
 
 def load_plugin():
@@ -88,6 +88,19 @@ def load_plugin():
     enums.Message = object
     listener_module = types.ModuleType("pagermaid.listener")
     listener_module.listener = lambda *args, **kwargs: lambda func: func
+    hook_module = types.ModuleType("pagermaid.hook")
+    registered_hooks = {}
+
+    def hook(event):
+        def decorator(func):
+            registered_hooks[event] = func
+            return func
+        return decorator
+
+    hook_module.Hook = types.SimpleNamespace(
+        reload_preprocessor=lambda: hook("reload_preprocessor"),
+        on_shutdown=lambda: hook("on_shutdown"),
+    )
 
     modules = {
         "httpx": httpx,
@@ -97,6 +110,7 @@ def load_plugin():
         "pagermaid.services": services,
         "pagermaid.enums": enums,
         "pagermaid.listener": listener_module,
+        "pagermaid.hook": hook_module,
     }
     old_modules = {name: sys.modules.get(name) for name in modules}
     sys.modules.update(modules)
@@ -106,6 +120,7 @@ def load_plugin():
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
+        module._test_registered_hooks = registered_hooks
         return module
     finally:
         for name, old_module in old_modules.items():
@@ -227,6 +242,31 @@ class SummarizeUserHelpersTests(unittest.TestCase):
         self.assertIsInstance(group_id, int)
         self.assertIsNone(link)
 
+    def test_api_url_requires_https_except_loopback(self):
+        self.assertTrue(self.module._valid_api_url("https://example.com/v1"))
+        self.assertTrue(self.module._valid_api_url("http://127.0.0.1:8000/v1"))
+        self.assertTrue(self.module._valid_api_url("http://[::1]:8000/v1"))
+        self.assertFalse(self.module._valid_api_url("http://example.com/v1"))
+
+    def test_oversized_header_and_one_liner_are_still_split_safely(self):
+        messages = self.module._build_result_messages(
+            "<blockquote>" + "h" * 5000 + "</blockquote>",
+            "💬" + "x" * 5000,
+            "",
+        )
+        self.assertGreater(len(messages), 1)
+        for message in messages:
+            self.assertLessEqual(
+                self.module._telegram_length(message),
+                self.module.TG_MSG_CHAR_LIMIT,
+            )
+            self.assertEqual(message.count("<blockquote"), message.count("</blockquote>"))
+
+    def test_shutdown_hook_closes_http_client(self):
+        self.assertFalse(self.module._http_client.closed)
+        asyncio.run(self.module._test_registered_hooks["on_shutdown"]())
+        self.assertTrue(self.module._http_client.closed)
+
     def test_long_results_have_balanced_html_and_telegram_safe_lengths(self):
         header = "<blockquote><b>header</b></blockquote>\n"
         detail = "**分析**\n" + "😀" * 5000
@@ -344,6 +384,25 @@ class SummarizeUserCallTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(Exception, "model unavailable") as raised:
             await self.call_llm()
         self.assertIn("server_error/overloaded", str(raised.exception))
+
+    async def test_insecure_remote_api_url_is_rejected_before_request(self):
+        with self.assertRaisesRegex(Exception, "HTTPS"):
+            await self.module._call_llm(
+                "text", "prompt", "secret", "http://example.com/v1", "model"
+            )
+
+    async def test_excessive_map_chunks_are_rejected(self):
+        original_chunk_texts = self.module._chunk_texts
+        self.module._chunk_texts = lambda texts: [
+            "chunk" for _ in range(self.module.MAX_ANALYSIS_CHUNKS + 1)
+        ]
+        try:
+            with self.assertRaisesRegex(Exception, "单次最多允许"):
+                await self.module._map_reduce_summary(
+                    ["message"], "secret", "https://example.com/v1", "model"
+                )
+        finally:
+            self.module._chunk_texts = original_chunk_texts
 
     async def test_all_map_failures_preserve_first_api_error(self):
         original_chunk_texts = self.module._chunk_texts

@@ -14,10 +14,10 @@ class FakeSqlite(dict):
 
 class StubAsyncClient:
     def __init__(self, *args, **kwargs):
-        pass
+        self.closed = False
 
     async def aclose(self):
-        pass
+        self.closed = True
 
 
 def load_plugin():
@@ -50,6 +50,19 @@ def load_plugin():
         return lambda func: func
 
     listener_module.listener = fake_listener
+    hook_module = types.ModuleType("pagermaid.hook")
+    registered_hooks = {}
+
+    def hook(event):
+        def decorator(func):
+            registered_hooks[event] = func
+            return func
+        return decorator
+
+    hook_module.Hook = types.SimpleNamespace(
+        reload_preprocessor=lambda: hook("reload_preprocessor"),
+        on_shutdown=lambda: hook("on_shutdown"),
+    )
 
     modules = {
         "httpx": httpx,
@@ -59,6 +72,7 @@ def load_plugin():
         "pagermaid.services": services,
         "pagermaid.enums": enums,
         "pagermaid.listener": listener_module,
+        "pagermaid.hook": hook_module,
     }
     old = {name: sys.modules.get(name) for name in modules}
     sys.modules.update(modules)
@@ -69,6 +83,7 @@ def load_plugin():
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         module._test_registered_commands = registered_commands
+        module._test_registered_hooks = registered_hooks
         return module
     finally:
         for name, value in old.items():
@@ -161,6 +176,19 @@ class ConflictAnalyzerTests(unittest.TestCase):
         self.assertEqual([record.message_id for record in selected], [10, 12, 13, 14])
         self.assertEqual({record.sender_name for record in selected}, {"A", "B", "D", "E"})
 
+    def test_explicit_no_conflict_does_not_fall_back_to_full_window(self):
+        now = datetime(2026, 1, 1)
+        records = [
+            self.module.ChatRecord(mid, now, f"user:{mid}", str(mid), "text")
+            for mid in range(1, 4)
+        ]
+        selected = self.module._select_relevant_records(
+            records,
+            {"is_conflict": False, "relevant_message_ids": []},
+            2,
+        )
+        self.assertEqual(selected, [])
+
     def test_invalid_too_narrow_selection_falls_back_to_full_window(self):
         now = datetime(2026, 1, 1)
         records = [
@@ -178,6 +206,28 @@ class ConflictAnalyzerTests(unittest.TestCase):
         )
         self.assertTrue(data["is_conflict"])
         self.assertEqual(data["relevant_message_ids"], [1, 2])
+
+    def test_api_url_requires_https_except_loopback(self):
+        self.assertTrue(self.module._valid_api_url("https://example.com/v1"))
+        self.assertTrue(self.module._valid_api_url("http://localhost:8000/v1"))
+        self.assertFalse(self.module._valid_api_url("http://example.com/v1"))
+
+    def test_oversized_header_is_converted_and_split_safely(self):
+        chunks = self.module._split_html_report(
+            "<blockquote>" + "h" * 5000 + "</blockquote>",
+            "report",
+        )
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertLessEqual(
+                self.module._telegram_length(chunk),
+                self.module.TG_MSG_CHAR_LIMIT,
+            )
+
+    def test_shutdown_hook_closes_http_client(self):
+        self.assertFalse(self.module._http_client.closed)
+        asyncio.run(self.module._test_registered_hooks["on_shutdown"]())
+        self.assertTrue(self.module._http_client.closed)
 
     def test_long_html_report_stays_within_telegram_limit(self):
         chunks = self.module._split_html_report(

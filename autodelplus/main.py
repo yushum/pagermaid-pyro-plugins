@@ -106,14 +106,21 @@ class DeleteJob:
 
     @classmethod
     def from_dict(cls, cid: int, mid: int, data: dict) -> "DeleteJob":
-        return cls(
-            due_at=data.get("due_at", 0),
-            chat_id=cid,
-            message_id=mid,
-            source=data.get("source", _SOURCE_CHAT),
-            retry_count=data.get("retry_count", 0),
-            flood_count=data.get("flood_count", 0),
-        )
+        due_at = data.get("due_at")
+        source = data.get("source", _SOURCE_CHAT)
+        retry_count = data.get("retry_count", 0)
+        flood_count = data.get("flood_count", 0)
+        if (
+            type(due_at) is not int
+            or due_at < 0
+            or source not in (_SOURCE_CHAT, _SOURCE_GLOBAL)
+            or type(retry_count) is not int
+            or retry_count < 0
+            or type(flood_count) is not int
+            or flood_count < 0
+        ):
+            raise ValueError("invalid persisted delete job")
+        return cls(due_at, cid, mid, source, retry_count, flood_count)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -372,20 +379,27 @@ class AutoDeleteScheduler:
                     if len(parts) == 4:  # v2/v3: autodel.job.{cid}.{mid}
                         try:
                             cid, mid = int(parts[2]), int(parts[3])
-                        except ValueError:
-                            continue
-                        data = sqlite.get(key)
-                        if isinstance(data, dict):
+                            data = sqlite.get(key)
+                            if not isinstance(data, dict):
+                                raise ValueError
                             jobs.append(DeleteJob.from_dict(cid, mid, data))
+                        except ValueError:
+                            logs.warning(f"[autodel] 已清理损坏的任务键: {key}")
+                            legacy_keys.append(key)
                     elif len(parts) == 5:  # v1: autodel.job.{ts}.{cid}.{mid}
                         try:
                             ts, cid, mid = int(parts[2]), int(parts[3]), int(parts[4])
                         except ValueError:
+                            logs.warning(f"[autodel] 已清理损坏的旧任务键: {key}")
+                            legacy_keys.append(key)
                             continue
                         job = DeleteJob(due_at=ts, chat_id=cid,
                                         message_id=mid, source=_SOURCE_CHAT)
                         jobs.append(job)
                         sqlite[_job_key(cid, mid)] = job.to_dict()
+                        legacy_keys.append(key)
+                    else:
+                        logs.warning(f"[autodel] 已清理无法识别的任务键: {key}")
                         legacy_keys.append(key)
                 elif key.startswith(idx_prefix):
                     legacy_keys.append(key)  # v2 索引结构已废弃
@@ -810,6 +824,8 @@ async def auto_del(message: Message):
     target_cids = remote_cids if is_remote else [message.chat.id]
 
     if args.startswith("reset"):
+        if is_remote:
+            return await message.edit("❌ `reset` 是全局操作，不能与 `-c` 同时使用。")
         return await message.edit(await _handle_reset(args))
 
     if args == "l":

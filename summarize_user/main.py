@@ -29,6 +29,7 @@ summarize_user — PagerMaid-Pyro 插件
 """
 
 import asyncio
+import html
 import json
 import logging
 import re
@@ -40,6 +41,7 @@ from pyrogram.enums import ChatType, ParseMode
 
 from pagermaid.listener import listener
 from pagermaid.enums import Client, Message
+from pagermaid.hook import Hook
 from pagermaid.services import sqlite
 
 # ---------------------------------------------------------------------------
@@ -68,6 +70,7 @@ CHUNK_MAX_CHARS = 30000        # Map-Reduce 每个分块的最大字符数
 API_TIMEOUT_SECONDS = 120.0    # API 请求超时（秒）
 TG_MSG_CHAR_LIMIT = 4096       # Telegram 单条消息字符上限
 MAX_CONCURRENT_REQUESTS = 3    # 并发 API 请求上限
+MAX_ANALYSIS_CHUNKS = 20       # 单次分析最大 API 分块数，防止意外产生巨额请求
 
 # ---------------------------------------------------------------------------
 # Prompts
@@ -159,8 +162,8 @@ _CONFIG_COMMANDS = {
         "key": BASE_URL_KEY,
         "label": "BASE_URL",
         "sensitive": False,
-        "validator": lambda v: v.startswith(("http://", "https://")),
-        "validator_msg": "URL 必须以 http:// 或 https:// 开头。",
+        "validator": lambda v: _valid_api_url(v),
+        "validator_msg": "API 地址必须使用 HTTPS；仅 localhost/127.0.0.1/[::1] 可使用 HTTP。",
     },
     "setmodel": {
         "key": MODEL_KEY,
@@ -197,6 +200,19 @@ def _mask_sensitive(value: str) -> str:
     if len(value) <= 10:
         return "****"
     return f"{value[:4]}{'*' * (len(value) - 8)}{value[-4:]}"
+
+
+def _valid_api_url(value: str) -> bool:
+    parts = urlsplit(value.strip())
+    return bool(parts.netloc) and (
+        parts.scheme == "https"
+        or (parts.scheme == "http" and parts.hostname in {"localhost", "127.0.0.1", "::1"})
+    )
+
+
+def _shorten(value: object, limit: int = 100) -> str:
+    text = str(value)
+    return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
 def _sanitize_error(error: object, api_key: Optional[str] = None) -> str:
@@ -271,20 +287,33 @@ def _build_result_messages(
 ) -> List[str]:
     """生成每条都满足长度限制且 HTML 标签完整的结果消息。"""
     prefix = header_html
-    if one_liner:
-        prefix += f"{_md_to_html(one_liner)}\n\n"
+    overflow_sections = []
+    if _telegram_length(prefix) > max_units:
+        overflow_sections.append(
+            html.unescape(re.sub(r"<[^>]+>", "", prefix)).strip()
+        )
+        prefix = ""
 
-    if not detail:
+    if one_liner:
+        rendered = f"{_md_to_html(one_liner)}\n\n"
+        if prefix and _telegram_length(prefix + rendered) <= max_units:
+            prefix += rendered
+        else:
+            overflow_sections.append(one_liner)
+    if detail:
+        overflow_sections.append(detail)
+
+    remaining = "\n\n".join(section for section in overflow_sections if section)
+    if not remaining:
         return [prefix]
 
     messages = []
-    remaining = detail
     available = max_units - _telegram_length(prefix)
     first_detail, remaining_after_first = _take_detail_chunk(remaining, available)
     if first_detail:
         messages.append(prefix + first_detail)
         remaining = remaining_after_first
-    else:
+    elif prefix:
         messages.append(prefix)
 
     while remaining:
@@ -780,6 +809,8 @@ async def _call_llm(
     model: str,
 ) -> str:
     """调用 OpenAI 兼容 API，返回模型生成的文本。"""
+    if not _valid_api_url(base_url):
+        raise Exception("API 地址必须使用 HTTPS；本机地址可使用 HTTP。")
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -853,6 +884,11 @@ async def _map_reduce_summary(
     """
     chunks = _chunk_texts(texts)
     total_chunks = len(chunks)
+    if total_chunks > MAX_ANALYSIS_CHUNKS:
+        raise Exception(
+            f"消息内容过多，共需 {total_chunks} 个 API 分块；"
+            f"单次最多允许 {MAX_ANALYSIS_CHUNKS} 个，请降低抓取数量。"
+        )
 
     if total_chunks == 1:
         # 单块：直接调用完整画像 Prompt
@@ -884,9 +920,14 @@ async def _map_reduce_summary(
             model,
         )
 
-    # 并发执行 Map（受 _api_semaphore 限制并发数）
-    map_tasks = [_map_one(i, chunk) for i, chunk in enumerate(chunks)]
-    partial_summaries = await asyncio.gather(*map_tasks, return_exceptions=True)
+    # 分批创建协程，避免大输入一次性堆积数百个任务和进度编辑。
+    partial_summaries = []
+    for start in range(0, total_chunks, MAX_CONCURRENT_REQUESTS):
+        batch = chunks[start:start + MAX_CONCURRENT_REQUESTS]
+        partial_summaries.extend(await asyncio.gather(
+            *(_map_one(start + offset, chunk) for offset, chunk in enumerate(batch)),
+            return_exceptions=True,
+        ))
 
     # 收集成功的局部摘要，记录失败的
     successful = []
@@ -1055,7 +1096,7 @@ async def summarize_user(client: Client, message: Message) -> None:
         if limit < 1:
             limit = DEFAULT_LIMIT
 
-    display_name = target_user.first_name or str(target_user.id)
+    display_name = _shorten(target_user.first_name or str(target_user.id))
 
     # 进度消息：始终编辑当前对话中的命令消息
     await message.edit(
@@ -1101,7 +1142,7 @@ async def summarize_user(client: Client, message: Message) -> None:
 
     # ---- 8. 输出结果 ----
     # 确定输出中显示的模型名称
-    display_model = sqlite.get(DISPLAY_MODEL_KEY, model)
+    display_model = _shorten(sqlite.get(DISPLAY_MODEL_KEY, model))
 
     # 分离一句话总结和详细分析
     one_liner, detail = _split_summary(summary)
@@ -1135,3 +1176,9 @@ async def summarize_user(client: Client, message: Message) -> None:
             _build_local_result_message(result_header, one_liner, detail),
             parse_mode=ParseMode.HTML,
         )
+
+
+@Hook.reload_preprocessor()
+@Hook.on_shutdown()
+async def close_summarize_user_http_client():
+    await _http_client.aclose()

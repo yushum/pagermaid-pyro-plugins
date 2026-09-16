@@ -19,5 +19,8 @@ PagerMaid-Pyro 用户画像分析插件
 - `,summarize_user setprompt <PROMPT>` — 自定义系统提示词
 - `,summarize_user showconfig` — 查看当前配置
 
+### 更新记录：
+- **1.6**：修复超长输出、明文远程 API 地址和连接池泄漏，并限制单次分析分块数量。
+
 ### 指令说明：
 详细指令请在 Telegram 内使用 `,help summarize_user` 查看。

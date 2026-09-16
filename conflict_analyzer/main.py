@@ -31,6 +31,7 @@ import httpx
 from pyrogram.enums import ChatType, ParseMode
 
 from pagermaid.enums import Client, Message
+from pagermaid.hook import Hook
 from pagermaid.listener import listener
 from pagermaid.services import sqlite
 
@@ -169,6 +170,19 @@ def _mask_sensitive(value: str) -> str:
     if len(value) <= 10:
         return "****"
     return f"{value[:4]}{'*' * (len(value) - 8)}{value[-4:]}"
+
+
+def _valid_api_url(value: str) -> bool:
+    parts = urlsplit(value.strip())
+    return bool(parts.netloc) and (
+        parts.scheme == "https"
+        or (parts.scheme == "http" and parts.hostname in {"localhost", "127.0.0.1", "::1"})
+    )
+
+
+def _shorten(value: object, limit: int = 100) -> str:
+    text = str(value)
+    return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
 def _sanitize_error(error: object, api_key: Optional[str] = None) -> str:
@@ -754,6 +768,8 @@ def _select_relevant_records(
                 continue
             if message_id in existing and message_id not in ids:
                 ids.append(message_id)
+    if selection.get("is_conflict") is False:
+        return [existing[mid] for mid in sorted(ids)]
     if anchor_id in existing and anchor_id not in ids:
         ids.append(anchor_id)
     # 模型筛选异常或过窄时保留完整窗口，避免凭少数消息强行裁决。
@@ -815,6 +831,8 @@ def _extract_content(data: object) -> Optional[str]:
 
 
 async def _call_llm(text: str, system_prompt: str, api_key: str, base_url: str, model: str) -> str:
+    if not _valid_api_url(base_url):
+        raise Exception("API 地址必须使用 HTTPS；本机地址可使用 HTTP。")
     payload = {
         "model": model,
         "messages": [
@@ -885,8 +903,8 @@ async def _handle_config(args: list, message: Message) -> bool:
         await message.edit(f"❌ 请提供 {mapping[command][1]} 的值。")
         return True
     value = " ".join(args[1:]) if command == "setdisplay" else args[1]
-    if command == "seturl" and not value.startswith(("http://", "https://")):
-        await message.edit("❌ URL 必须以 http:// 或 https:// 开头。")
+    if command == "seturl" and not _valid_api_url(value):
+        await message.edit("❌ API 地址必须使用 HTTPS；仅 localhost/127.0.0.1/[::1] 可使用 HTTP。")
         return True
     sqlite[mapping[command][0]] = value
     if command == "setapi":
@@ -910,6 +928,9 @@ def _markdown_to_html(value: str) -> str:
 def _split_html_report(header: str, report: str) -> List[str]:
     """按原始行切分，每片单独转换 HTML，保证标签闭合且不超长。"""
     chunks = []
+    if _telegram_length(header) > TG_MSG_CHAR_LIMIT:
+        report = html.unescape(re.sub(r"<[^>]+>", "", header)).strip() + "\n" + report
+        header = ""
     current = header
     for line in report.splitlines(keepends=True):
         rendered = _markdown_to_html(line)
@@ -1024,6 +1045,27 @@ async def _run_conflict(client: Client, message: Message) -> None:
         selection, relevant = await _filter_records(
             records, anchor.id, api_key, base_url, model
         )
+        if selection.get("is_conflict") is False:
+            display_model = _shorten(_get_setting(
+                DISPLAY_MODEL_KEY, FALLBACK_DISPLAY_MODEL, model
+            ))
+            no_conflict_header = (
+                "<blockquote>"
+                "⚖️ <b>群聊冲突分析</b>\n"
+                f"📍 群组：<b>{html.escape(_shorten(chat_title))}</b>\n"
+                f"🎯 锚点消息：<code>{anchor.id}</code>\n"
+                f"🤖 模型：<b>{html.escape(display_model)}</b>"
+                "</blockquote>\n"
+            )
+            note = selection.get("selection_note")
+            no_conflict_report = "未识别到足以确认发生冲突的证据。"
+            if isinstance(note, str) and note.strip():
+                no_conflict_report += f"\n\n**模型说明：** {note.strip()}"
+            parts = _split_html_report(no_conflict_header, no_conflict_report)
+            await message.edit(parts[0], parse_mode=ParseMode.HTML)
+            for part in parts[1:]:
+                await client.send_message(message.chat.id, part, parse_mode=ParseMode.HTML)
+            return
 
         # 跨天模式或显式指定参与者时，按第一轮筛选出的参与者补搜未回复发言。
         participant_mode = bool(user_identifiers) or bool(
@@ -1092,14 +1134,14 @@ async def _run_conflict(client: Client, message: Message) -> None:
             parse_mode=ParseMode.DISABLED,
         )
 
-    display_model = _get_setting(
+    display_model = _shorten(_get_setting(
         DISPLAY_MODEL_KEY, FALLBACK_DISPLAY_MODEL, model
-    )
+    ))
     boundary_warning = "\n⚠️ 候选窗口触及抓取上限，边界信息可能不完整。" if truncated else ""
     header = (
         "<blockquote>"
         f"⚖️ <b>群聊冲突分析</b>\n"
-        f"📍 群组：<b>{html.escape(str(chat_title))}</b>\n"
+        f"📍 群组：<b>{html.escape(_shorten(chat_title))}</b>\n"
         f"🎯 锚点消息：<code>{anchor.id}</code>\n"
         f"📊 候选 {len(records)} 条，相关 {len(relevant)} 条\n"
         f"🤖 模型：<b>{html.escape(str(display_model))}</b>"
@@ -1142,3 +1184,9 @@ async def conflict_analyzer(client: Client, message: Message) -> None:
 )
 async def conflict(client: Client, message: Message) -> None:
     await _run_conflict(client, message)
+
+
+@Hook.reload_preprocessor()
+@Hook.on_shutdown()
+async def close_conflict_analyzer_http_client():
+    await _http_client.aclose()

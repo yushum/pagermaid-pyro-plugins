@@ -131,6 +131,36 @@ class AutoDeleteSchedulerTests(unittest.TestCase):
 
         asyncio.run(check())
 
+    def test_remote_reset_is_rejected_without_clearing_global_state(self):
+        module, sqlite = load_plugin()
+        sqlite[module._timer_key(0)] = 60
+        edits = []
+
+        class Message:
+            arguments = "reset confirm -c -100123"
+            chat = types.SimpleNamespace(id=-100999)
+
+            async def edit(self, text):
+                edits.append(text)
+
+        asyncio.run(module.auto_del(Message()))
+        self.assertEqual(sqlite[module._timer_key(0)], 60)
+        self.assertIn("不能与 `-c` 同时使用", edits[-1])
+
+    def test_invalid_persisted_job_is_removed_before_scheduling(self):
+        module, sqlite = load_plugin()
+        key = module._job_key(-1, 42)
+        sqlite[key] = {
+            "due_at": "bad",
+            "source": "chat",
+            "retry_count": 0,
+            "flood_count": 0,
+        }
+
+        jobs = module.AutoDeleteScheduler()._load_jobs_from_db()
+        self.assertEqual(jobs, [])
+        self.assertNotIn(key, sqlite)
+
     def test_queue_does_not_silently_drop_jobs_after_5000(self):
         module, _ = load_plugin()
         scheduler = module.AutoDeleteScheduler()
