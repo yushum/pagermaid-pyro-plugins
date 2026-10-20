@@ -921,30 +921,17 @@ async def _map_reduce_summary(
         )
 
     # 分批创建协程，避免大输入一次性堆积数百个任务和进度编辑。
-    partial_summaries = []
+    successful = []
     for start in range(0, total_chunks, MAX_CONCURRENT_REQUESTS):
         batch = chunks[start:start + MAX_CONCURRENT_REQUESTS]
-        partial_summaries.extend(await asyncio.gather(
+        results = await asyncio.gather(
             *(_map_one(start + offset, chunk) for offset, chunk in enumerate(batch)),
             return_exceptions=True,
-        ))
-
-    # 收集成功的局部摘要，记录失败的
-    successful = []
-    failures = []
-    for i, result in enumerate(partial_summaries):
-        if isinstance(result, Exception):
-            log.warning("第 %d/%d 块分析失败: %s", i + 1, total_chunks, result)
-            failures.append(result)
-        else:
-            successful.append(f"**第 {i + 1} 段分析：**\n{result}")
-
-    if failures:
-        first_error = _sanitize_error(failures[0])
-        raise Exception(
-            f"{len(failures)}/{total_chunks} 个分块分析失败，已停止生成不完整画像。"
-            f"首个错误：{first_error}"
         )
+        for offset, result in enumerate(results):
+            if isinstance(result, BaseException):
+                raise result
+            successful.append(f"**第 {start + offset + 1} 段分析：**\n{result}")
 
     # --- Reduce 阶段：合并所有局部摘要 ---
     if progress_callback:
@@ -1168,7 +1155,8 @@ async def summarize_user(client: Client, message: Message) -> None:
         await message.edit(parts[0], parse_mode=ParseMode.HTML)
         for part in parts[1:]:
             await client.send_message(
-                message.chat.id, part, parse_mode=ParseMode.HTML
+                message.chat.id, part, parse_mode=ParseMode.HTML,
+                message_thread_id=message.message_thread_id,
             )
     else:
         # 群内模式：安全截断，确保不会留下未闭合的 HTML 标签。

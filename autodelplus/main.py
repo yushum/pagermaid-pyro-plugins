@@ -25,12 +25,13 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from pyrogram import errors as pyrogram_errors
+from pyrogram import errors as pyrogram_errors, filters
 from pyrogram.errors import FloodWait
+from pyromod.utils import mod_filters
 
 from pagermaid.services import bot, sqlite
 from pagermaid.enums import Message
-from pagermaid.listener import listener
+from pagermaid.listener import listener, raw_listener
 from pagermaid.hook import Hook
 from pagermaid.utils import alias_command, logs
 
@@ -348,13 +349,8 @@ class AutoDeleteScheduler:
         self.worker_task = asyncio.create_task(self.worker(client))
 
     async def init(self) -> None:
-        """从 DB 恢复任务。
-
-        扫描期间仍可能有新任务入队或旧任务被取消，因此不能
-        直接覆盖内存态。恢复前再确认 DB 键仍存在，并与已入队
-        的任务合并，可同时避免丢任务和复活已取消任务。
-        """
-        jobs = await asyncio.to_thread(self._load_jobs_from_db)
+        """在事件循环中恢复任务，恢复过程与取消操作顺序执行。"""
+        jobs = self._load_jobs_from_db()
         for job in jobs:
             if not isinstance(sqlite.get(_job_key(job.chat_id, job.message_id)), dict):
                 continue
@@ -437,6 +433,15 @@ class AutoDeleteScheduler:
                 del self.chat_counts[cid]
         self._db_del(cid, mid)
 
+    def _finish_job(self, job: DeleteJob) -> None:
+        if self.live.get(job.key) is job:
+            self._forget(job.chat_id, job.message_id)
+
+    def _retry_job(self, job: DeleteJob, delay: int) -> None:
+        if self.live.get(job.key) is job:
+            job.due_at = int(time.time()) + delay
+            self.add_job(job)
+
     def remove_jobs(self, cids: Optional[List[int]] = None,
                     source: Optional[str] = None) -> int:
         """按聊天与来源精确清理排队任务。
@@ -474,19 +479,11 @@ class AutoDeleteScheduler:
     # ── 消费循环 ──
 
     def _pop_expired(self, now: int) -> List[DeleteJob]:
-        """弹出所有到期且仍存活的任务，并将其转为『在途』状态（移出 live）。
-
-        通过 `live.get(key) is job` 的对象身份校验实现懒删除：
-        被取消或已重排的任务在堆中的旧条目会被静默丢弃。
-        """
+        """取出到期任务，保留 live 中的身份直至完成或取消。"""
         expired: List[DeleteJob] = []
         while self.job_heap and self.job_heap[0].due_at <= now:
             job = heapq.heappop(self.job_heap)
             if self.live.get(job.key) is job:
-                del self.live[job.key]
-                self.chat_counts[job.chat_id] -= 1
-                if self.chat_counts[job.chat_id] <= 0:
-                    del self.chat_counts[job.chat_id]
                 expired.append(job)
         return expired
 
@@ -526,6 +523,9 @@ class AutoDeleteScheduler:
                 await self._process_batch(client, cid, chat_jobs[i:i + _DELETE_BATCH_SIZE])
 
     async def _process_batch(self, client, cid: int, jobs: List[DeleteJob]) -> None:
+        jobs = [job for job in jobs if self.live.get(job.key) is job]
+        if not jobs:
+            return
         mids = [j.message_id for j in jobs]
         try:
             await client.delete_messages(cid, mids)
@@ -539,10 +539,9 @@ class AutoDeleteScheduler:
                         f"[autodel] 任务 {cid}/{job.message_id} FloodWait "
                         f"重排超过 {_MAX_FLOOD_RETRIES} 次，放弃"
                     )
-                    self._db_del(cid, job.message_id)
+                    self._finish_job(job)
                 else:
-                    job.due_at = int(time.time()) + wait + 1
-                    self.add_job(job)
+                    self._retry_job(job, wait + 1)
         except _DROP_ERRORS as e:
             if len(jobs) > 1:
                 # 批量中一条已不存在时，不能连带放弃其他有效消息。
@@ -555,7 +554,7 @@ class AutoDeleteScheduler:
                     f"[autodel] 放弃聊天 {cid} 的任务 "
                     f"{job.message_id}: {type(e).__name__}"
                 )
-                self._db_del(cid, job.message_id)
+                self._finish_job(job)
         except Exception as e:
             if len(jobs) > 1:
                 # 拆批逐条重试，防止单条失败拖垮整批
@@ -569,14 +568,13 @@ class AutoDeleteScheduler:
                         f"[autodel] 任务 {cid}/{job.message_id} 重试超过 "
                         f"{_MAX_RETRIES} 次，放弃: {e}"
                     )
-                    self._db_del(cid, job.message_id)
+                    self._finish_job(job)
                 else:
                     backoff = 5 * (3 ** (job.retry_count - 1))
-                    job.due_at = int(time.time()) + backoff
-                    self.add_job(job)
+                    self._retry_job(job, backoff)
         else:
             for job in jobs:
-                self._db_del(cid, job.message_id)
+                self._finish_job(job)
 
 
 scheduler = AutoDeleteScheduler()
@@ -787,8 +785,8 @@ async def _handle_reset(args: str) -> str:
             f"如需继续，请发送 `,{cmd} reset confirm`。"
         )
 
-    # 全量键扫描在线程池中执行，避免大库阻塞事件循环
-    timer_count, excl_count = await asyncio.to_thread(_clear_all)
+    # 与任务状态变更在同一个事件循环中执行。
+    timer_count, excl_count = _clear_all()
     if timer_count == 0 and excl_count == 0:
         return "ℹ️ 当前没有任何自动删除设置，无需清除。"
 
@@ -854,7 +852,10 @@ async def auto_del(message: Message):
         await message.edit(f"❌ 设置失败: {e}")
 
 
-@listener(incoming=False, outgoing=True, ignore_forwarded=False, ignore_via_bot=False)
+_AUTO_DELETE_FILTER = filters.me & ~mod_filters.reacted
+
+
+@raw_listener(_AUTO_DELETE_FILTER)
 async def auto_del_task(message: Message):
     if not message.chat:
         return

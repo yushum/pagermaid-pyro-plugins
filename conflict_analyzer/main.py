@@ -162,6 +162,13 @@ class ChatRecord:
     topic_id: Optional[int] = None
 
 
+@dataclass
+class RecordInput:
+    text: str
+    records: List[ChatRecord]
+    truncated: bool
+
+
 def _telegram_length(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
@@ -576,20 +583,27 @@ async def _fetch_participant_messages(
     seconds: int,
     topic_id: Optional[int] = None,
     exclude_ids=None,
-) -> List[ChatRecord]:
+) -> Tuple[List[ChatRecord], bool]:
     """搜索指定参与者在跨天范围内的发言，并补取每条命中附近的上下文。"""
     lower_bound = anchor_date - timedelta(seconds=seconds)
     upper_bound = anchor_date + timedelta(seconds=seconds)
     excluded = set(exclude_ids or ())
     hits: Dict[int, ChatRecord] = {}
 
-    async def fetch_one(user_id: int) -> List[ChatRecord]:
+    async def fetch_one(user_id: int) -> Tuple[List[ChatRecord], bool]:
         found = []
+        scanned = 0
         async for raw in client.search_messages(
             chat_id,
             from_user=user_id,
-            limit=MAX_PARTICIPANT_SEARCH_SCANNED_PER_USER,
+            min_date=lower_bound - timedelta(seconds=1),
+            max_date=upper_bound + timedelta(seconds=1),
+            message_thread_id=topic_id,
+            limit=MAX_PARTICIPANT_SEARCH_SCANNED_PER_USER + 1,
         ):
+            scanned += 1
+            if scanned > MAX_PARTICIPANT_SEARCH_SCANNED_PER_USER:
+                break
             if not raw or getattr(raw, "empty", False) or not getattr(raw, "date", None):
                 continue
             if raw.date > upper_bound:
@@ -603,22 +617,31 @@ async def _fetch_participant_messages(
                 record.context_only = True
                 record.context_kind = "参与者补搜"
                 found.append(record)
-        return sorted(
+        ordered = sorted(
             found,
             key=lambda item: (
                 abs((item.date - anchor_date).total_seconds()),
                 item.message_id,
             ),
-        )[:MAX_PARTICIPANT_MESSAGES_PER_USER]
+        )
+        return (
+            ordered[:MAX_PARTICIPANT_MESSAGES_PER_USER],
+            scanned > MAX_PARTICIPANT_SEARCH_SCANNED_PER_USER
+            or len(ordered) > MAX_PARTICIPANT_MESSAGES_PER_USER,
+        )
 
-    results = await asyncio.gather(*(fetch_one(user_id) for user_id in user_ids))
-    for result in results:
+    results = await asyncio.gather(*(fetch_one(user_id) for user_id in sorted(user_ids)))
+    truncated = any(limited for _, limited in results)
+    for result, _ in results:
         for record in result:
             hits[record.message_id] = record
-            if len(hits) >= MAX_PARTICIPANT_MESSAGES:
-                break
-        if len(hits) >= MAX_PARTICIPANT_MESSAGES:
-            break
+    if len(hits) > MAX_PARTICIPANT_MESSAGES:
+        nearest = sorted(
+            hits.values(),
+            key=lambda item: (abs((item.date - anchor_date).total_seconds()), item.message_id),
+        )[:MAX_PARTICIPANT_MESSAGES]
+        hits = {item.message_id: item for item in nearest}
+        truncated = True
 
     # 补取命中消息附近少量内容，让未使用回复功能的接话者进入候选集。
     neighbor_ids = set()
@@ -641,13 +664,14 @@ async def _fetch_participant_messages(
         ):
             continue
         record = _message_to_record(raw)
-        if record:
+        if record and record.message_id not in hits:
+            if len(hits) >= MAX_PARTICIPANT_MESSAGES:
+                truncated = True
+                break
             record.context_only = True
             record.context_kind = "补搜上下文"
-            hits.setdefault(record.message_id, record)
-        if len(hits) >= MAX_PARTICIPANT_MESSAGES:
-            break
-    return sorted(hits.values(), key=lambda item: item.message_id)
+            hits[record.message_id] = record
+    return sorted(hits.values(), key=lambda item: item.message_id), truncated
 
 
 def _merge_records(*groups: List[ChatRecord]) -> List[ChatRecord]:
@@ -704,14 +728,13 @@ def _format_record_line(item: ChatRecord, anchor_id: int) -> str:
     )
 
 
-def _format_records(records: List[ChatRecord], anchor_id: int) -> str:
+def _format_records(records: List[ChatRecord], anchor_id: int) -> RecordInput:
     lines = [_format_record_line(item, anchor_id) for item in records]
     rendered = "\n".join(lines)
     if len(rendered) <= MAX_INPUT_CHARS:
-        return rendered
+        return RecordInput(rendered, records, any(len(item.text) > 4000 for item in records))
 
-    # 超出输入预算时，优先保留锚点、回复图节点和本地窗口，同时让跨天岛屿
-    # 按时间均匀进入输入，避免只留下离锚点最近的一段。
+    # 超出输入预算时，优先保留锚点、回复关系和本地窗口。
     referenced_ids = {
         item.reply_to_message_id for item in records if item.reply_to_message_id
     }
@@ -732,9 +755,11 @@ def _format_records(records: List[ChatRecord], anchor_id: int) -> str:
             continue
         kept.append(item)
         used += len(line) + 1
-    return "\n".join(
-        _format_record_line(item, anchor_id)
-        for item in sorted(kept, key=lambda value: value.message_id)
+    kept.sort(key=lambda item: item.message_id)
+    return RecordInput(
+        "\n".join(_format_record_line(item, anchor_id) for item in kept),
+        kept,
+        True,
     )
 
 
@@ -784,16 +809,49 @@ async def _filter_records(
     api_key: str,
     base_url: str,
     model: str,
-) -> Tuple[dict, List[ChatRecord]]:
+) -> Tuple[dict, List[ChatRecord], RecordInput]:
+    formatted = _format_records(records, anchor_id)
     selection_raw = await _call_llm(
-        "以下是候选聊天记录：\n\n" + _format_records(records, anchor_id),
+        f"已读取 {len(records)} 条，实际提供 {len(formatted.records)} 条。\n"
+        f"输入是否有省略或截断：{'是' if formatted.truncated else '否'}。\n"
+        "以下是候选聊天记录：\n\n" + formatted.text,
         FILTER_SYSTEM_PROMPT,
         api_key,
         base_url,
         model,
     )
     selection = _extract_json_object(selection_raw)
-    return selection, _select_relevant_records(records, selection, anchor_id)
+    if type(selection.get("is_conflict")) is not bool:
+        raise ValueError("模型返回的 is_conflict 必须为布尔值。")
+    return selection, _select_relevant_records(formatted.records, selection, anchor_id), formatted
+
+
+async def _generate_report(
+    selection: dict,
+    formatted: RecordInput,
+    fetch_truncated: bool,
+    input_truncated: bool,
+    api_key: str,
+    base_url: str,
+    model: str,
+) -> str:
+    if type(selection.get("is_conflict")) is not bool:
+        raise ValueError("模型返回的 is_conflict 必须为布尔值。")
+    if not selection["is_conflict"]:
+        report = "未识别到足以确认发生冲突的证据。"
+        note = selection.get("selection_note")
+        if isinstance(note, str) and note.strip():
+            report += f"\n\n**模型说明：** {note.strip()}"
+        return report
+
+    report_input = (
+        f"筛选信息：{json.dumps(selection, ensure_ascii=False)}\n"
+        f"抓取或补搜是否触及上限：{'是' if fetch_truncated else '否'}\n"
+        f"模型输入是否有省略或截断：{'是' if input_truncated else '否'}\n"
+        f"本次实际提供 {len(formatted.records)} 条原始消息：\n\n"
+        + formatted.text
+    )
+    return await _call_llm(report_input, REPORT_SYSTEM_PROMPT, api_key, base_url, model)
 
 
 def _build_chat_completions_url(base_url: str) -> str:
@@ -1042,30 +1100,10 @@ async def _run_conflict(client: Client, message: Message) -> None:
 
     await message.edit(f"⏳ 已读取 **{len(records)}** 条候选消息，正在识别冲突范围...")
     try:
-        selection, relevant = await _filter_records(
+        selection, relevant, filter_input = await _filter_records(
             records, anchor.id, api_key, base_url, model
         )
-        if selection.get("is_conflict") is False:
-            display_model = _shorten(_get_setting(
-                DISPLAY_MODEL_KEY, FALLBACK_DISPLAY_MODEL, model
-            ))
-            no_conflict_header = (
-                "<blockquote>"
-                "⚖️ <b>群聊冲突分析</b>\n"
-                f"📍 群组：<b>{html.escape(_shorten(chat_title))}</b>\n"
-                f"🎯 锚点消息：<code>{anchor.id}</code>\n"
-                f"🤖 模型：<b>{html.escape(display_model)}</b>"
-                "</blockquote>\n"
-            )
-            note = selection.get("selection_note")
-            no_conflict_report = "未识别到足以确认发生冲突的证据。"
-            if isinstance(note, str) and note.strip():
-                no_conflict_report += f"\n\n**模型说明：** {note.strip()}"
-            parts = _split_html_report(no_conflict_header, no_conflict_report)
-            await message.edit(parts[0], parse_mode=ParseMode.HTML)
-            for part in parts[1:]:
-                await client.send_message(message.chat.id, part, parse_mode=ParseMode.HTML)
-            return
+        input_truncated = filter_input.truncated
 
         # 跨天模式或显式指定参与者时，按第一轮筛选出的参与者补搜未回复发言。
         participant_mode = bool(user_identifiers) or bool(
@@ -1074,6 +1112,8 @@ async def _run_conflict(client: Client, message: Message) -> None:
         scanned_user_ids: Set[int] = set()
         if participant_mode:
             for round_index in range(MAX_PARTICIPANT_ROUNDS):
+                if not selection["is_conflict"]:
+                    break
                 discovered_ids = _user_ids_from_records(relevant) | explicit_user_ids
                 pending_ids = discovered_ids - scanned_user_ids
                 pending_ids = set(sorted(pending_ids)[:MAX_PARTICIPANTS])
@@ -1083,7 +1123,7 @@ async def _run_conflict(client: Client, message: Message) -> None:
                 await message.edit(
                     f"⏳ 正在补搜跨天参与者发言（第 {round_index + 1}/{MAX_PARTICIPANT_ROUNDS} 轮）..."
                 )
-                participant_records = await _fetch_participant_messages(
+                participant_records, participant_truncated = await _fetch_participant_messages(
                     client,
                     chat_id,
                     pending_ids,
@@ -1108,25 +1148,24 @@ async def _run_conflict(client: Client, message: Message) -> None:
                 records, limit_truncated = _limit_records(
                     records, anchor.id, preferred_ids
                 )
-                truncated = truncated or reply_truncated or limit_truncated
+                truncated = truncated or participant_truncated or reply_truncated or limit_truncated
                 if {item.message_id for item in records} == previous_ids:
                     break
-                selection, relevant = await _filter_records(
+                selection, relevant, filter_input = await _filter_records(
                     records, anchor.id, api_key, base_url, model
                 )
+                input_truncated = input_truncated or filter_input.truncated
 
-        await message.edit(
-            f"⏳ 已从 **{len(records)}** 条候选消息中选出 **{len(relevant)}** 条相关消息，正在分析责任..."
-        )
-        selection_context = json.dumps(selection, ensure_ascii=False)
-        report_input = (
-            f"筛选信息：{selection_context}\n"
-            f"候选窗口是否触及抓取上限：{'是' if truncated else '否'}\n\n"
-            "以下是筛选后未经改写的原始消息：\n\n"
-            + _format_records(relevant, anchor.id)
-        )
-        report = await _call_llm(
-            report_input, REPORT_SYSTEM_PROMPT, api_key, base_url, model
+        report_records = _format_records(relevant, anchor.id)
+        input_truncated = input_truncated or report_records.truncated
+        if selection["is_conflict"]:
+            await message.edit(
+                f"⏳ 已选出 **{len(relevant)}** 条相关消息，"
+                f"将提供 **{len(report_records.records)}** 条生成报告..."
+            )
+        report = await _generate_report(
+            selection, report_records, truncated, input_truncated,
+            api_key, base_url, model,
         )
     except Exception as exc:
         return await message.edit(
@@ -1137,13 +1176,21 @@ async def _run_conflict(client: Client, message: Message) -> None:
     display_model = _shorten(_get_setting(
         DISPLAY_MODEL_KEY, FALLBACK_DISPLAY_MODEL, model
     ))
-    boundary_warning = "\n⚠️ 候选窗口触及抓取上限，边界信息可能不完整。" if truncated else ""
+    boundary_warning = "\n⚠️ 抓取或补搜触及上限，边界信息可能不完整。" if truncated else ""
+    if input_truncated:
+        boundary_warning += "\n⚠️ 模型输入达到字符上限，部分消息或文字未提供给模型。"
+    report_count = (
+        f"📝 报告输入 {len(report_records.records)} 条\n"
+        if selection["is_conflict"] else ""
+    )
     header = (
         "<blockquote>"
         f"⚖️ <b>群聊冲突分析</b>\n"
         f"📍 群组：<b>{html.escape(_shorten(chat_title))}</b>\n"
         f"🎯 锚点消息：<code>{anchor.id}</code>\n"
-        f"📊 候选 {len(records)} 条，相关 {len(relevant)} 条\n"
+        f"📊 读取 {len(records)} 条，筛选输入 {len(filter_input.records)} 条，"
+        f"相关 {len(relevant)} 条\n"
+        f"{report_count}"
         f"🤖 模型：<b>{html.escape(str(display_model))}</b>"
         f"{html.escape(boundary_warning)}"
         "</blockquote>\n"
@@ -1151,7 +1198,10 @@ async def _run_conflict(client: Client, message: Message) -> None:
     parts = _split_html_report(header, report)
     await message.edit(parts[0], parse_mode=ParseMode.HTML)
     for part in parts[1:]:
-        await client.send_message(message.chat.id, part, parse_mode=ParseMode.HTML)
+        await client.send_message(
+            message.chat.id, part, parse_mode=ParseMode.HTML,
+            message_thread_id=message.message_thread_id,
+        )
 
 
 _HELP_DESCRIPTION = (

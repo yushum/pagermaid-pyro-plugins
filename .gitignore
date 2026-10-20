@@ -17,3 +17,6 @@ venv.bak/
 .vscode/
 *.swp
 *.swo
+
+# 本地验证与部署中间文件
+.work/
