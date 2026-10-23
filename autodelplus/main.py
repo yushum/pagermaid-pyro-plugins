@@ -27,11 +27,13 @@ from typing import Dict, List, Optional, Tuple
 
 from pyrogram import errors as pyrogram_errors, filters
 from pyrogram.errors import FloodWait
+from pyrogram.handlers import MessageHandler
 from pyromod.utils import mod_filters
 
+from pagermaid.common.ignore import ignore_groups_manager
 from pagermaid.services import bot, sqlite
 from pagermaid.enums import Message
-from pagermaid.listener import listener, raw_listener
+from pagermaid.listener import listener
 from pagermaid.hook import Hook
 from pagermaid.utils import alias_command, logs
 
@@ -855,9 +857,8 @@ async def auto_del(message: Message):
 _AUTO_DELETE_FILTER = filters.me & ~mod_filters.reacted
 
 
-@raw_listener(_AUTO_DELETE_FILTER)
 async def auto_del_task(message: Message):
-    if not message.chat:
+    if not message.chat or ignore_groups_manager.check_id(message.chat.id):
         return
 
     scheduler.ensure_worker(_get_client(message))
@@ -874,3 +875,13 @@ async def auto_del_task(message: Message):
     except Exception as e:
         # 不能让调度失败影响消息发送流程，但必须留下日志便于排障
         logs.warning(f"[autodel] 调度消息删除任务失败: {e}", exc_info=True)
+
+
+async def _auto_del_handler(client, message: Message):
+    # 框架 raw_listener 会写入 read_context 且不清除，导致后续普通命令被跳过。
+    # 自动删除只安排任务，不应占用命令的处理标记。
+    await auto_del_task(message)
+    message.continue_propagation()
+
+
+bot.add_handler(MessageHandler(_auto_del_handler, filters=_AUTO_DELETE_FILTER), group=2)

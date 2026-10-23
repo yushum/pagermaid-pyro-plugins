@@ -1,12 +1,16 @@
 import asyncio
 import time
 import unittest
+from unittest.mock import AsyncMock, patch
 
+from pyrogram import ContinuePropagation
 from pyrogram.enums import ChatType
 from pyrogram.types import Chat, Message, MessageOriginUser, User
 from sqlitedict import SqliteDict
 
 from plugin_support import bot, load_plugin, sqlite
+from pagermaid.common.ignore import ignore_groups_manager
+from pagermaid.static import read_context
 
 
 module = load_plugin("autodelplus")
@@ -113,3 +117,50 @@ class AutoDeleteTests(unittest.TestCase):
         for value in ("0 s", "-1 m", "31 d", "1 m 2 minutes"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 module.parse_time(value)
+
+    def test_auto_delete_allows_later_command_handler(self):
+        async def check():
+            own = User(id=123, first_name="测试", is_self=True)
+            message = Message(
+                id=99, chat=Chat(id=123, type=ChatType.PRIVATE),
+                from_user=own, outgoing=False, text=",help", client=bot,
+            )
+            read_context.clear()
+            sqlite[module._timer_key(123)] = 60
+            callback = AsyncMock()
+            from pagermaid.listener import listener
+            async def handle_command(message: Message):
+                await callback(message)
+            command = listener(command="autodel_regression_probe")(handle_command)
+            registered = next(
+                handler for handler in bot.dispatcher.groups[2]
+                if getattr(handler, "user_callback", handler.callback) is module._auto_del_handler
+            )
+            try:
+                # 按真实分发顺序先执行自动删除，再执行普通命令包装器。
+                with patch.object(module.scheduler, "ensure_worker"):
+                    self.assertTrue(await registered.check(bot, message))
+                    with self.assertRaises(ContinuePropagation):
+                        await registered.callback(bot, message)
+                self.assertNotIn((123, 99), read_context)
+                self.assertIn((123, 99), module.scheduler.live)
+                message.arguments = ""
+                with self.assertRaises(ContinuePropagation):
+                    await command.get_handler()(bot, message)
+                callback.assert_awaited_once_with(message)
+                self.assertNotIn((123, 99), read_context)
+            finally:
+                read_context.clear()
+        asyncio.run(check())
+
+    def test_auto_delete_respects_ignored_chats(self):
+        async def check():
+            message = Message(id=99, chat=Chat(id=123, type=ChatType.PRIVATE), client=bot)
+            sqlite[module._timer_key(123)] = 60
+            ignore_groups_manager.add_id(123)
+            with patch.object(module.scheduler, "ensure_worker") as worker:
+                with self.assertRaises(ContinuePropagation):
+                    await module._auto_del_handler(bot, message)
+            worker.assert_not_called()
+            self.assertNotIn((123, 99), module.scheduler.live)
+        asyncio.run(check())
