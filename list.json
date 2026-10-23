@@ -29,6 +29,16 @@
       "supported": true,
       "des_short": "群聊冲突分析插件",
       "des": "以消息为锚点识别多人争执，支持跨天回复链、上下文岛和参与者补搜。"
+    },
+    {
+      "name": "linkcopy",
+      "version": "1.1",
+      "section": "chat",
+      "maintainer": "yusum",
+      "size": "15.66 kb",
+      "supported": true,
+      "des_short": "按消息链接复制文字和媒体",
+      "des": "使用 ,linkcopy <消息链接> 替换为原文或媒体。所有媒体优先复用文件引用，明确被拒绝后再下载重传。支持相册、话题、评论和回复取链接；--single 只复制相册中的一条。需要当前账号可读取来源。"
     }
   ]
 }

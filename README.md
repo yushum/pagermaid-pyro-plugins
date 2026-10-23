@@ -9,6 +9,7 @@
 | `autodelplus` | 自动清理消息 | 设置当前聊天或全局的消息自动删除定时，支持将特定群组排除在全局规则外，以及远程无痕管理其他聊天的定时任务。 |
 | `summarize_user` | 用户画像分析 | 抓取指定用户发言，调用 OpenAI 兼容 API 生成精准的用户画像分析报告，支持跨群远程零痕迹分析。 |
 | `conflict_analyzer` | 群聊冲突分析 | 以消息为锚点还原多人争执，支持跨天回复链、上下文岛和参与者补搜。 |
+| `linkcopy` | 按链接复制消息 | 将消息链接替换为文字或媒体，支持受保护媒体下载重传、相册和话题。详见 [使用说明](linkcopy/DES.md)。 |
 
 ## 🚀 如何安装
 
@@ -24,6 +25,7 @@
 ,apt install autodelplus
 ,apt install summarize_user
 ,apt install conflict_analyzer
+,apt install linkcopy
 ```
 
 ## 📝 许可证
