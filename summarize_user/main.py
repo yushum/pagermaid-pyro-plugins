@@ -2,13 +2,13 @@
 summarize_user — PagerMaid-Pyro 插件
 
 功能：抓取指定用户在群组/频道的发言，调用 OpenAI 兼容 API 生成用户画像分析报告。
-     支持远程群组定向分析（零痕迹）和 Map-Reduce 分块分析（支持 2000+ 条消息）。
+     支持读取指定群组，在当前对话显示结果；消息较多时使用 Map-Reduce 分段分析。
 
 用法：
   消息链接分析（最简单，支持私密群组 + 无用户名用户）：
     ,summarize_user -l <消息链接> [数量]
 
-  远程分析（零痕迹）：
+  远程群组分析（在当前对话显示结果）：
     ,summarize_user -g <群组> [数量] <用户>
 
   群内分析：
@@ -962,7 +962,7 @@ async def _map_reduce_summary(
         "对用户发言进行总结画像\n\n"
         "消息链接分析（私密群/无用户名皆可）：\n"
         "  ,summarize_user -l <消息链接> [数量]\n\n"
-        "远程分析（零痕迹）：\n"
+        "远程群组分析（在当前对话显示结果）：\n"
         "  ,summarize_user -g <群组> [数量] <用户>\n\n"
         "群内分析：\n"
         "  ,summarize_user [数量] [用户]\n\n"

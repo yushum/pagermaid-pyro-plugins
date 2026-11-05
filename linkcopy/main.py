@@ -1,5 +1,3 @@
-"""按 Telegram 消息链接或链接区间复制文字和媒体。"""
-
 import asyncio
 import logging
 import re
@@ -10,7 +8,7 @@ from tempfile import TemporaryDirectory
 from time import monotonic
 from urllib.parse import parse_qs, urlsplit
 
-from pyrogram import errors, raw
+from pyrogram import errors, raw, utils
 from pyrogram.enums import ParseMode
 from pyrogram.file_id import FileId, FileType
 from pyrogram.types import (
@@ -19,6 +17,7 @@ from pyrogram.types import (
     InputMediaPhoto,
     InputMediaVideo,
     LinkPreviewOptions,
+    ReplyParameters,
 )
 
 from pagermaid.enums import Client, Message
@@ -70,7 +69,7 @@ _batches = {}
 BATCH_LIMIT = 1000
 BATCH_FETCH_SIZE = 100
 BATCH_DELAY = 1
-BATCH_STATUS_INTERVAL = 10
+BATCH_STATUS_INTERVAL = 3
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 DOWNLOAD_THRESHOLD = 16 * 1024 * 1024
 DOWNLOAD_WORKERS = 4
@@ -99,6 +98,8 @@ class BatchState:
     handled: set = field(default_factory=set)
     sent: int = 0
     skipped: int = 0
+    last_status: float = 0
+    command_id: int | None = None
 
     @property
     def next_id(self):
@@ -113,8 +114,8 @@ class BatchState:
     def summary(self):
         total = self.end.message_id - self.start.message_id + 1
         return (
-            f"进度：{len(self.handled)}/{total} 个消息 ID；"
-            f"已发送 {self.sent} 条，跳过 {self.skipped} 条。"
+            f"已处理 {len(self.handled)}/{total}（{len(self.handled) / total:.1%}）\n"
+            f"已发送 {self.sent} 条 · 已跳过 {self.skipped} 条"
         )
 
 
@@ -245,13 +246,65 @@ async def _status(message, text):
     )
 
 
-async def _transfer_status(command, text):
+async def _transfer_status(command, text, force=False):
     if command is None:
         return
+    state = _batches.get(command.chat.id)
+    if state is not None and state.command_id != command.id:
+        state = None
+    now = monotonic()
+    if state is not None:
+        if not force and now - state.last_status < BATCH_STATUS_INTERVAL:
+            return
+        text = "批量复制中\n" + state.summary() + "\n" + text + "\n停止：,linkcopy cancel"
     try:
         await _status(command, text)
+    except errors.MessageNotModified:
+        pass
     except Exception as exc:  # noqa: BLE001 — 进度通知失败不影响文件传输。
         log.warning("linkcopy transfer progress failed: %s", type(exc).__name__)
+    finally:
+        if state is not None:
+            state.last_status = now
+
+
+@dataclass
+class TransferProgress:
+    command: Message | None
+    label: str
+    started: float = field(default_factory=monotonic)
+    last_status: float = 0
+
+    def text(self, current, total, now):
+        mib = 1024 * 1024
+        speed = current / max(now - self.started, 0.001)
+        if total > 0:
+            percent = current * 1000 // total / 10
+            details = f"{percent:.1f}% · {current / mib:.1f}/{total / mib:.1f} MiB"
+        else:
+            details = f"已传输 {current / mib:.1f} MiB"
+        if speed > 0:
+            details += f" · {speed / mib:.2f} MiB/s"
+            if total > current:
+                remaining = max(1, int((total - current) / speed))
+                minutes, seconds = divmod(remaining, 60)
+                details += f"\n预计剩余 {minutes} 分 {seconds} 秒"
+        return self.label + "\n" + details
+
+    async def update(self, current, total):
+        now = monotonic()
+        if now - self.last_status < DOWNLOAD_STATUS_INTERVAL:
+            return
+        self.last_status = now
+        await _transfer_status(self.command, self.text(current, total, now))
+
+
+async def _delete_command(message):
+    try:
+        await _rpc(message.delete)
+    except Exception as exc:  # noqa: BLE001 — 内容已发送，清理异常不改变发送结果。
+        log.warning("linkcopy content sent; command deletion failed: %s", type(exc).__name__)
+        await _transfer_status(message, "复制完成，进度消息删除失败，请手动删除。", force=True)
 
 
 def _destination(message, from_reply):
@@ -299,6 +352,12 @@ def _metadata(message, kind):
         kwargs["has_spoiler"] = bool(message.has_media_spoiler)
     if kind == "video":
         kwargs["supports_streaming"] = bool(media.supports_streaming)
+        cover = getattr(media, "video_cover", None)
+        if cover is not None:
+            kwargs["video_cover"] = cover.file_id
+        timestamp = getattr(media, "video_start_timestamp", None)
+        if timestamp is not None:
+            kwargs["video_start_timestamp"] = timestamp
     if kind == "video_note":
         kwargs["length"] = media.length
     return kwargs
@@ -348,24 +407,8 @@ async def _parallel_download(client, media, target, command=None):
         session = await client.get_session(file_id.dc_id, is_media=True)
         completed = 0
         started = monotonic()
-        last_status = started
-
-        async def progress(force=False):
-            nonlocal last_status
-            now = monotonic()
-            if command is None or (not force and now - last_status < DOWNLOAD_STATUS_INTERVAL):
-                return
-            last_status = now
-            mib = 1024 * 1024
-            speed = completed / mib / max(now - started, 0.001)
-            text = (
-                f"正在并行下载媒体（{workers} 路）…\n"
-                f"{completed / size:.1%} · {completed / mib:.1f}/{size / mib:.1f} MiB\n"
-                f"平均速度：{speed:.2f} MiB/s"
-            )
-            await _transfer_status(command, text)
-
-        await progress(force=True)
+        progress = TransferProgress(command, f"正在下载：{target.name}（{workers} 路并行）", started)
+        await progress.update(0, size)
         try:
             with target.open("wb") as output:
                 async def worker(index):
@@ -388,11 +431,11 @@ async def _parallel_download(client, media, target, command=None):
                         if len(result.bytes) != expected:
                             raise LinkCopyError("媒体下载失败：分块长度不符，没有发送不完整的文件。")
                         # seek/write 间没有 await，同一事件循环中不会交错写入。
-                        # 按绝对偏移落盘，完成顺序不影响文件顺序，内存只保留每路一块。
+                        # 按文件位置写入，完成顺序不影响文件顺序，内存只保留每路一块。
                         output.seek(offset)
                         output.write(result.bytes)
                         completed += expected
-                        await progress()
+                        await progress.update(completed, size)
 
                 tasks = [asyncio.create_task(worker(index)) for index in range(workers)]
                 try:
@@ -411,12 +454,12 @@ async def _parallel_download(client, media, target, command=None):
                 await _transfer_status(command, "当前媒体使用 CDN，正在切换原生下载器…")
                 return False
             raise
-        await progress(force=True)
+        await progress.update(completed, size)
         return True
 
 
 async def _download(client, message, directory, index, command=None):
-    # 每项独立目录，避免相册同名文件互相覆盖；使用磁盘而不是把大文件放进内存。
+    # 每项使用独立目录，避免相册中的同名文件互相覆盖。
     target = directory / str(index)
     target.mkdir()
     kind, media = _media(message)
@@ -440,7 +483,11 @@ async def _download(client, message, directory, index, command=None):
     target = target / filename
     if await _parallel_download(client, media, target, command):
         return str(target)
-    path = await _rpc(client.download_media, message, file_name=str(target))
+    progress = TransferProgress(command, f"正在下载：{filename}")
+    await progress.update(0, getattr(media, "file_size", None) or 0)
+    path = await _rpc(
+        client.download_media, message, file_name=str(target), progress=progress.update,
+    )
     if not path or not Path(path).is_file():
         raise LinkCopyError("媒体下载失败；没有发送内容，请稍后重试。")
     # 原生下载同样检查已知大小，防止静默截断的文件被重新上传。
@@ -450,9 +497,38 @@ async def _download(client, message, directory, index, command=None):
     return path
 
 
-async def _send_single(client, source, destination, local_path=None):
+def _preview_sources(source):
+    kind, media = _media(source)
+    if kind not in ("video", "animation", "audio", "document", "video_note"):
+        return {}
+    previews = {}
+    thumbs = getattr(media, "thumbs", None) or []
+    if thumbs:
+        previews["thumb"] = max(thumbs, key=lambda thumb: thumb.width * thumb.height)
+    cover = getattr(media, "video_cover", None)
+    if kind == "video" and cover is not None:
+        previews["video_cover"] = cover
+    return previews
+
+
+async def _download_previews(client, source, directory):
+    paths = {}
+    for name, preview in _preview_sources(source).items():
+        path = await _rpc(client.download_media, preview, file_name=str(directory / (name + ".jpg")))
+        if not path or not Path(path).is_file() or Path(path).stat().st_size == 0:
+            raise LinkCopyError("媒体封面下载失败。")
+        paths[name] = path
+    return paths
+
+
+async def _send_single(client, source, destination, local_path=None, previews=None, command=None):
     kind, media = _media(source)
     kwargs = _metadata(source, kind)
+    if local_path:
+        kwargs.update(previews or {})
+        progress = TransferProgress(command, f"正在上传：{Path(local_path).name}")
+        await progress.update(0, Path(local_path).stat().st_size)
+        kwargs["progress"] = progress.update
     if kind not in ("sticker", "video_note"):
         kwargs.update(_caption(source))
     if kind in ("photo", "video", "animation"):
@@ -466,7 +542,141 @@ async def _send_single(client, source, destination, local_path=None):
     )
 
 
-async def _send_album(client, sources, destination, paths=None):
+def _album_upload(source, file, thumb, file_name):
+    kind, attachment = _media(source)
+    if kind == "photo":
+        return raw.types.InputMediaUploadedPhoto(file=file, spoiler=bool(source.has_media_spoiler))
+    attributes = [raw.types.DocumentAttributeFilename(file_name=file_name)]
+    if kind == "video":
+        attributes.append(raw.types.DocumentAttributeVideo(
+            duration=attachment.duration,
+            w=attachment.width,
+            h=attachment.height,
+            supports_streaming=bool(attachment.supports_streaming),
+        ))
+    elif kind == "audio":
+        attributes.append(raw.types.DocumentAttributeAudio(
+            duration=attachment.duration, performer=attachment.performer, title=attachment.title,
+        ))
+    elif kind != "document":
+        raise LinkCopyError("相册中包含不支持的媒体。")
+    return raw.types.InputMediaUploadedDocument(
+        file=file,
+        thumb=thumb,
+        mime_type=attachment.mime_type or {
+            "video": "video/mp4", "audio": "audio/mpeg", "document": "application/octet-stream",
+        }[kind],
+        attributes=attributes,
+        spoiler=bool(source.has_media_spoiler) if kind == "video" else None,
+        nosound_video=True if kind == "video" else None,
+        force_file=True if kind == "document" else None,
+    )
+
+
+def _video_cover(source):
+    video = source.video
+    cover = getattr(video, "video_cover", None) if video else None
+    return utils.get_input_media_from_file_id(cover.file_id, FileType.PHOTO).id if cover else None
+
+
+async def _send_album_raw(client, sources, destination, paths, previews, command):
+    peer = await _rpc(client.resolve_peer, destination["chat_id"])
+    items = []
+    for index, source in enumerate(sources):
+        kind, attachment = _media(source)
+        if kind not in _ALBUM_TYPES:
+            raise LinkCopyError("相册中包含不支持的媒体。")
+        if paths:
+            path = paths[index]
+            progress = TransferProgress(
+                command, f"正在上传相册 {index + 1}/{len(sources)}：{Path(path).name}",
+            )
+            await progress.update(0, Path(path).stat().st_size)
+            thumb_path = previews[index].get("thumb")
+            thumb = await _rpc(client.save_file, thumb_path) if thumb_path else None
+            if thumb_path and thumb is None:
+                raise LinkCopyError("媒体缩略图上传失败。")
+            file = await _rpc(client.save_file, path, progress=progress.update)
+            if file is None:
+                raise LinkCopyError("相册媒体上传失败。")
+            uploaded = await _rpc(
+                client.invoke,
+                raw.functions.messages.UploadMedia(
+                    peer=peer,
+                    media=_album_upload(
+                        source, file, thumb, getattr(attachment, "file_name", None) or Path(path).name,
+                    ),
+                ),
+                retries=1, sleep_threshold=0,
+            )
+            if kind == "photo":
+                photo = uploaded.photo
+                media = raw.types.InputMediaPhoto(id=raw.types.InputPhoto(
+                    id=photo.id, access_hash=photo.access_hash, file_reference=photo.file_reference,
+                ), spoiler=bool(source.has_media_spoiler))
+            else:
+                document = uploaded.document
+                media = raw.types.InputMediaDocument(id=raw.types.InputDocument(
+                    id=document.id, access_hash=document.access_hash,
+                    file_reference=document.file_reference,
+                ), spoiler=bool(source.has_media_spoiler) if kind == "video" else None)
+        else:
+            media = utils.get_input_media_from_file_id(
+                attachment.file_id, has_spoiler=bool(source.has_media_spoiler),
+            )
+        if kind == "video":
+            cover_path = previews[index].get("video_cover") if previews else None
+            if cover_path:
+                cover_file = await _rpc(client.save_file, cover_path)
+                if cover_file is None:
+                    raise LinkCopyError("视频封面上传失败。")
+                uploaded = await _rpc(
+                    client.invoke,
+                    raw.functions.messages.UploadMedia(
+                        peer=peer, media=raw.types.InputMediaUploadedPhoto(file=cover_file),
+                    ),
+                    retries=1, sleep_threshold=0,
+                )
+                photo = uploaded.photo
+                media.video_cover = raw.types.InputPhoto(
+                    id=photo.id, access_hash=photo.access_hash, file_reference=photo.file_reference,
+                )
+            else:
+                media.video_cover = _video_cover(source)
+            media.video_timestamp = getattr(attachment, "video_start_timestamp", None)
+        items.append(raw.types.InputSingleMedia(
+            media=media, random_id=client.rnd_id(),
+            **await utils.parse_text_entities(
+                client, str(source.caption or ""), ParseMode.DISABLED, source.caption_entities,
+            ),
+        ))
+    reply_id = destination.get("reply_to_message_id")
+    reply = ReplyParameters(message_id=reply_id) if reply_id else None
+    result = await _rpc(
+        client.invoke,
+        raw.functions.messages.SendMultiMedia(
+            peer=peer, multi_media=items,
+            reply_to=await utils.get_reply_to(
+                client, reply_parameters=reply,
+                message_thread_id=destination.get("message_thread_id"),
+            ),
+            invert_media=bool(sources[0].show_caption_above_media),
+        ),
+        retries=1, sleep_threshold=0,
+    )
+    return await utils.parse_messages(client=client, messages=result)
+
+
+async def _send_album(client, sources, destination, paths=None, previews=None, command=None):
+    # 原始相册接口支持逐项上传进度及独立的视频封面。
+    if paths or any(
+        source.video and (
+            _video_cover(source) is not None
+            or getattr(source.video, "video_start_timestamp", None) is not None
+        )
+        for source in sources
+    ):
+        return await _send_album_raw(client, sources, destination, paths, previews, command)
     media = []
     for index, source in enumerate(sources):
         kind, attachment = _media(source)
@@ -474,7 +684,7 @@ async def _send_album(client, sources, destination, paths=None):
             raise LinkCopyError("相册中包含不支持的媒体。")
         media.append(
             _ALBUM_TYPES[kind](
-                media=paths[index] if paths else attachment.file_id,
+                media=attachment.file_id,
                 **_caption(source),
                 **_metadata(source, kind),
             )
@@ -500,16 +710,22 @@ async def _copy_media(client, sources, destination, command):
         return
     except _REUPLOAD_ERRORS:
         pass
-    await _status(command, "正在下载并重新上传媒体…\n大文件可能需要较长时间。")
-    with TemporaryDirectory(prefix="linkcopy-") as temporary:
-        paths = []
+    await _transfer_status(command, "正在下载媒体，下载完成后重新上传…")
+    temporary_root = Path(".work/linkcopy")
+    temporary_root.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix="transfer-", dir=temporary_root) as temporary:
+        paths, previews = [], []
         for index, source in enumerate(sources):
             paths.append(await _download(client, source, Path(temporary), index, command))
-        await _transfer_status(command, "媒体下载完成，正在重新上传…\n大文件上传可能需要较长时间。")
+            preview_dir = Path(temporary) / "previews" / str(index)
+            preview_dir.mkdir(parents=True)
+            await _transfer_status(command, f"正在下载封面：{index + 1}/{len(sources)}")
+            previews.append(await _download_previews(client, source, preview_dir))
+        await _transfer_status(command, "下载完成，正在上传媒体…")
         if album:
-            result = await _send_album(client, sources, destination, paths)
+            result = await _send_album(client, sources, destination, paths, previews, command)
         else:
-            result = await _send_single(client, sources[0], destination, paths[0])
+            result = await _send_single(client, sources[0], destination, paths[0], previews[0], command)
         if not result:
             raise LinkCopyError("Telegram 没有返回发送结果，请检查目标聊天后再重试。")
 
@@ -594,12 +810,11 @@ async def _run_batch(client, message, start, end, single):
     chat_id = message.chat.id
     if chat_id in _batches:
         raise LinkCopyError("当前聊天已有批量任务；请等待完成或使用 ,linkcopy cancel。")
-    state = BatchState(start, end)
+    state = BatchState(start, end, command_id=message.id)
     destination = _destination(message, False)
     _batches[chat_id] = state
     try:
-        await _status(message, "开始批量复制…\n" + state.summary() + "\n停止：,linkcopy cancel")
-        last_status = asyncio.get_running_loop().time()
+        await _transfer_status(message, "正在读取来源消息…")
         for first in range(start.message_id, end.message_id + 1, BATCH_FETCH_SIZE):
             _batch_checkpoint(state)
             ids = list(range(first, min(first + BATCH_FETCH_SIZE, end.message_id + 1)))
@@ -643,11 +858,9 @@ async def _run_batch(client, message, start, end, single):
                     state.handled.update(copied)
                     if state.next_id is not None:
                         await _batch_pause(state)
-                now = asyncio.get_running_loop().time()
-                if now - last_status >= BATCH_STATUS_INTERVAL:
-                    await _status(message, "正在批量复制…\n" + state.summary() + "\n停止：,linkcopy cancel")
-                    last_status = now
-        await _status(message, "批量复制完成。\n" + state.summary())
+                if state.next_id is not None:
+                    await _transfer_status(message, "正在复制消息…")
+        await _delete_command(message)
     except BatchStopped:
         text = "批量复制已停止。\n" + state.summary()
         if state.next_id is not None:
@@ -706,20 +919,7 @@ async def _run(client, message):
         arg for arg in (message.arguments or "").split() if arg != "--single"
     ]
     await _copy_media(client, sources, _destination(message, from_reply), message)
-    # 发送确认成功后才删除命令；删除失败不应再次发送内容。
-    try:
-        await _rpc(message.delete)
-    except Exception as exc:  # noqa: BLE001 — 内容已发送，清理异常不得重发或报告发送失败。
-        log.warning(
-            "linkcopy content sent; command deletion failed: %s", type(exc).__name__
-        )
-        try:
-            await _status(message, "内容已发送，命令消息未能删除。")
-        except Exception as status_exc:  # noqa: BLE001 — 状态通知失败也不改变发送成功的结果。
-            log.warning(
-                "linkcopy content sent; status update failed: %s",
-                type(status_exc).__name__,
-            )
+    await _delete_command(message)
 
 
 @listener(

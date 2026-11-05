@@ -12,33 +12,33 @@
     },
     {
       "name": "summarize_user",
-      "version": "1.7",
+      "version": "1.8",
       "section": "chat",
       "maintainer": "yusum",
-      "size": "41.96 kb",
+      "size": "42.01 kb",
       "supported": true,
       "des_short": "用户画像生成插件",
-      "des": "抓取指定用户在群组的发言，调用AI生成画像分析报告，支持零痕迹及分块分析。"
+      "des": "读取指定用户的发言，通过 OpenAI 兼容 API 分析话题和表达特征，支持远程群组及分段分析，结果在当前对话显示。发言会发送到配置的 API 服务，分析结果仅供参考。"
     },
     {
       "name": "conflict_analyzer",
-      "version": "1.3",
+      "version": "1.4",
       "section": "chat",
       "maintainer": "yusum",
-      "size": "47.22 kb",
+      "size": "47.25 kb",
       "supported": true,
       "des_short": "群聊冲突分析插件",
-      "des": "以消息为锚点识别多人争执，支持跨天回复链、上下文岛和参与者补搜。"
+      "des": "围绕指定消息分析多人争执，支持追踪跨天回复、读取引用消息附近的上下文，并补充搜索参与者发言。"
     },
     {
       "name": "linkcopy",
-      "version": "1.3",
+      "version": "1.4",
       "section": "chat",
       "maintainer": "yusum",
-      "size": "29.01 kb",
+      "size": "37.57 kb",
       "supported": true,
       "des_short": "按消息链接复制文字和媒体",
-      "des": "使用 ,linkcopy <起始链接> [结束链接] 复制原文或媒体，支持最多1000个消息ID的区间批量搬运、相册去重、进度与cancel停止。媒体优先复用文件引用，明确被拒绝后再下载重传；大文件自动4路并行下载，含进度与速度显示，CDN自动回退原生下载。支持话题、单条评论和回复取链接；--single 逐条复制媒体。需要当前账号可读取来源。"
+      "des": "使用 ,linkcopy <起始链接> [结束链接] 复制文字和媒体，单次最多处理 1000 个消息 ID。支持相册、来源视频封面、Topic、单条评论和回复获取链接；--single 逐条复制，cancel 停止批量任务。显示批量计数及文件传输进度，完成后自动删除进度消息。媒体优先复用文件引用，明确被拒绝后下载重传；大文件支持最多 4 路并行下载。需要当前账号能够读取来源。"
     }
   ]
 }

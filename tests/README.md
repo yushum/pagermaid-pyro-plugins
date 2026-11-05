@@ -1,5 +1,26 @@
 # 插件验证
 
+## linkcopy 消息结构与进度验证
+
+以下命令加载真实 PagerMaid 和 Pyrogram，运行 `test_linkcopy_payloads.py`，不使用 mock，也不会连接 Telegram：
+
+```bash
+docker run --rm --network none \
+  -e PGM_PLUGIN_TESTING=1 \
+  -e PGM_ALLOW_ANALYTIC=false \
+  -e PGM_ERROR_REPORT=false \
+  -e TMPDIR=/pagermaid/workdir/.work \
+  -v "$PWD:/review:ro" \
+  --entrypoint sh pagermaid-plugins:linkcopy-test \
+  -c 'mkdir -p data .work; cp config.gen.yml data/config.yml; python /review/tests/run_payloads.py'
+```
+
+需要本机已有兼容测试镜像。测试覆盖批量计数、传输进度文本、缩略图选择、视频封面与播放起点、媒体上传属性，以及 MTProto 请求的序列化和反序列化。进度消息删除调用通过源码结构检查；Telegram 服务端是否接受删除、封面及相册发送，需要在线账号验证。
+
+## 完整测试目录
+
+`tests/run.sh` 会执行整个测试目录，其中部分用例使用 `unittest.mock` 替代 Telegram 客户端方法。上述无 mock 验证使用独立入口。
+
 测试直接加载 PagerMaid、Pyrogram、httpx 和 SqliteDict，使用独立容器的配置与数据库。容器禁用网络，不需要 Telegram session 或 API 密钥。
 
 在已经运行 PagerMaid 容器的主机上，从本仓库目录执行：
