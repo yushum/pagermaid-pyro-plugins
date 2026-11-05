@@ -1,15 +1,18 @@
-"""按 Telegram 消息链接复制内容：,linkcopy <链接> [--single]。"""
+"""按 Telegram 消息链接或链接区间复制文字和媒体。"""
 
 import asyncio
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from struct import error as StructError
 from tempfile import TemporaryDirectory
+from time import monotonic
 from urllib.parse import parse_qs, urlsplit
 
-from pyrogram import errors
+from pyrogram import errors, raw
 from pyrogram.enums import ParseMode
+from pyrogram.file_id import FileId, FileType
 from pyrogram.types import (
     InputMediaAudio,
     InputMediaDocument,
@@ -23,9 +26,10 @@ from pagermaid.listener import listener
 
 log = logging.getLogger("linkcopy")
 HELP = (
-    "用法：,linkcopy <消息链接> [--single]\n"
+    "用法：,linkcopy <起始链接> [结束链接] [--single]\n"
+    "两个链接批量复制同一聊天内的闭区间，最多 1000 个消息 ID。\n"
     "也可以回复一条含消息链接的消息发送 ,linkcopy。\n"
-    "默认复制整个相册；--single 只复制链接指向的一条。"
+    "默认保留相册；--single 逐条复制。批量任务用 ,linkcopy cancel 停止。"
 )
 _URL = re.compile(
     r"(?<![\w./])(?:https?://(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/"
@@ -62,6 +66,17 @@ _ALBUM_TYPES = {
     "document": InputMediaDocument,
 }
 _active = set()
+_batches = {}
+BATCH_LIMIT = 1000
+BATCH_FETCH_SIZE = 100
+BATCH_DELAY = 1
+BATCH_STATUS_INTERVAL = 10
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+DOWNLOAD_THRESHOLD = 16 * 1024 * 1024
+DOWNLOAD_WORKERS = 4
+DOWNLOAD_STATUS_INTERVAL = 3
+# 插件内只允许一个并行下载，避免多条命令把分块并发数成倍放大。
+_parallel_download_slots = asyncio.Semaphore(1)
 
 
 class LinkCopyError(Exception):
@@ -74,6 +89,37 @@ class MessageLink:
     message_id: int
     single: bool = False
     comment_id: int | None = None
+
+
+@dataclass
+class BatchState:
+    start: MessageLink
+    end: MessageLink
+    stop: asyncio.Event = field(default_factory=asyncio.Event)
+    handled: set = field(default_factory=set)
+    sent: int = 0
+    skipped: int = 0
+
+    @property
+    def next_id(self):
+        return next(
+            (
+                mid for mid in range(self.start.message_id, self.end.message_id + 1)
+                if mid not in self.handled
+            ),
+            None,
+        )
+
+    def summary(self):
+        total = self.end.message_id - self.start.message_id + 1
+        return (
+            f"进度：{len(self.handled)}/{total} 个消息 ID；"
+            f"已发送 {self.sent} 条，跳过 {self.skipped} 条。"
+        )
+
+
+class BatchStopped(Exception):
+    """用户请求在当前发送结束后停止。"""
 
 
 def _positive(value):
@@ -153,13 +199,28 @@ def _request(message):
     args = (message.arguments or "").split()
     single = "--single" in args
     args = [arg for arg in args if arg != "--single"]
-    if len(args) == 1:
+    if len(args) == 3 and args[1] in ("-", "到"):
+        args.pop(1)
+    end = None
+    if len(args) in (1, 2):
         link = parse_link(args[0])
+        if len(args) == 2:
+            end = parse_link(args[1])
+            start_chat = link.chat.casefold() if isinstance(link.chat, str) else link.chat
+            end_chat = end.chat.casefold() if isinstance(end.chat, str) else end.chat
+            if start_chat != end_chat:
+                raise LinkCopyError("批量复制的两个链接必须来自同一频道或群组。")
+            if link.comment_id is not None or end.comment_id is not None:
+                raise LinkCopyError("评论链接暂不支持区间复制，请使用单条链接。")
+            if end.message_id < link.message_id:
+                raise LinkCopyError("结束消息 ID 不能小于起始消息 ID。")
+            if end.message_id - link.message_id + 1 > BATCH_LIMIT:
+                raise LinkCopyError(f"一次最多复制 {BATCH_LIMIT} 个消息 ID，请缩小区间。")
     elif not args and message.reply_to_message:
         link = _reply_link(message.reply_to_message)
     else:
         raise LinkCopyError(HELP)
-    return link, single or link.single
+    return link, single or link.single or bool(end and end.single), end
 
 
 async def _rpc(func, *args, **kwargs):
@@ -182,6 +243,15 @@ async def _status(message, text):
         parse_mode=ParseMode.DISABLED,
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
+
+
+async def _transfer_status(command, text):
+    if command is None:
+        return
+    try:
+        await _status(command, text)
+    except Exception as exc:  # noqa: BLE001 — 进度通知失败不影响文件传输。
+        log.warning("linkcopy transfer progress failed: %s", type(exc).__name__)
 
 
 def _destination(message, from_reply):
@@ -234,7 +304,118 @@ def _metadata(message, kind):
     return kwargs
 
 
-async def _download(client, message, directory, index):
+class ParallelDownloadFallback(Exception):
+    """需要交回原生下载器处理（例如 CDN 解密及哈希校验）。"""
+
+
+async def _parallel_download(client, media, target, command=None):
+    size = getattr(media, "file_size", None)
+    # 只优化大小已知的大文件；旧版 Pyrogram 没有 get_session 时保留原路径。
+    if (
+        not isinstance(size, int) or size < DOWNLOAD_THRESHOLD
+        or not callable(getattr(client, "get_session", None))
+        or getattr(client, "get_file_semaphore", None) is None
+    ):
+        return False
+    try:
+        file_id = FileId.decode(media.file_id)
+    except (ValueError, TypeError, KeyError, StructError):
+        return False
+    if file_id.file_type == FileType.PHOTO:
+        location = raw.types.InputPhotoFileLocation(
+            id=file_id.media_id,
+            access_hash=file_id.access_hash,
+            file_reference=file_id.file_reference,
+            thumb_size=file_id.thumbnail_size,
+        )
+    elif file_id.file_type in (
+        FileType.VIDEO, FileType.DOCUMENT, FileType.AUDIO, FileType.VOICE,
+        FileType.ANIMATION, FileType.STICKER, FileType.VIDEO_NOTE,
+    ):
+        location = raw.types.InputDocumentFileLocation(
+            id=file_id.media_id,
+            access_hash=file_id.access_hash,
+            file_reference=file_id.file_reference,
+            thumb_size=file_id.thumbnail_size,
+        )
+    else:
+        return False
+
+    chunks = (size + DOWNLOAD_CHUNK_SIZE - 1) // DOWNLOAD_CHUNK_SIZE
+    workers = min(DOWNLOAD_WORKERS, chunks)
+    async with _parallel_download_slots, client.get_file_semaphore:
+        # 使用客户端已有的 DC 认证、代理和媒体连接，不创建第二个账号或改全局设置。
+        session = await client.get_session(file_id.dc_id, is_media=True)
+        completed = 0
+        started = monotonic()
+        last_status = started
+
+        async def progress(force=False):
+            nonlocal last_status
+            now = monotonic()
+            if command is None or (not force and now - last_status < DOWNLOAD_STATUS_INTERVAL):
+                return
+            last_status = now
+            mib = 1024 * 1024
+            speed = completed / mib / max(now - started, 0.001)
+            text = (
+                f"正在并行下载媒体（{workers} 路）…\n"
+                f"{completed / size:.1%} · {completed / mib:.1f}/{size / mib:.1f} MiB\n"
+                f"平均速度：{speed:.2f} MiB/s"
+            )
+            await _transfer_status(command, text)
+
+        await progress(force=True)
+        try:
+            with target.open("wb") as output:
+                async def worker(index):
+                    nonlocal completed
+                    for part in range(index, chunks, workers):
+                        offset = part * DOWNLOAD_CHUNK_SIZE
+                        result = await _rpc(
+                            session.invoke,
+                            raw.functions.upload.GetFile(
+                                location=location, offset=offset, limit=DOWNLOAD_CHUNK_SIZE,
+                            ),
+                            retries=1,
+                            sleep_threshold=0,
+                        )
+                        if isinstance(result, raw.types.upload.FileCdnRedirect):
+                            raise ParallelDownloadFallback()
+                        if not isinstance(result, raw.types.upload.File):
+                            raise LinkCopyError("媒体下载失败：服务器返回了未知的分块类型。")
+                        expected = min(DOWNLOAD_CHUNK_SIZE, size - offset)
+                        if len(result.bytes) != expected:
+                            raise LinkCopyError("媒体下载失败：分块长度不符，没有发送不完整的文件。")
+                        # seek/write 间没有 await，同一事件循环中不会交错写入。
+                        # 按绝对偏移落盘，完成顺序不影响文件顺序，内存只保留每路一块。
+                        output.seek(offset)
+                        output.write(result.bytes)
+                        completed += expected
+                        await progress()
+
+                tasks = [asyncio.create_task(worker(index)) for index in range(workers)]
+                try:
+                    await asyncio.gather(*tasks)
+                finally:
+                    # gather 遇错不会自动取消其他任务；必须排空后才能关闭或删掉文件。
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            if completed != size or target.stat().st_size != size:
+                raise LinkCopyError("媒体下载失败：文件大小校验不符，没有发送内容。")
+        except BaseException as exc:
+            target.unlink(missing_ok=True)
+            if isinstance(exc, ParallelDownloadFallback):
+                await _transfer_status(command, "当前媒体使用 CDN，正在切换原生下载器…")
+                return False
+            raise
+        await progress(force=True)
+        return True
+
+
+async def _download(client, message, directory, index, command=None):
     # 每项独立目录，避免相册同名文件互相覆盖；使用磁盘而不是把大文件放进内存。
     target = directory / str(index)
     target.mkdir()
@@ -256,9 +437,16 @@ async def _download(client, message, directory, index):
                 ".tgs" if media.is_animated else ".webm" if media.is_video else ".webp"
             )
         filename = "media" + extension
-    path = await _rpc(client.download_media, message, file_name=str(target / filename))
+    target = target / filename
+    if await _parallel_download(client, media, target, command):
+        return str(target)
+    path = await _rpc(client.download_media, message, file_name=str(target))
     if not path or not Path(path).is_file():
         raise LinkCopyError("媒体下载失败；没有发送内容，请稍后重试。")
+    # 原生下载同样检查已知大小，防止静默截断的文件被重新上传。
+    size = getattr(media, "file_size", None)
+    if isinstance(size, int) and size > 0 and Path(path).stat().st_size != size:
+        raise LinkCopyError("媒体下载失败：文件大小校验不符，没有发送内容。")
     return path
 
 
@@ -316,7 +504,8 @@ async def _copy_media(client, sources, destination, command):
     with TemporaryDirectory(prefix="linkcopy-") as temporary:
         paths = []
         for index, source in enumerate(sources):
-            paths.append(await _download(client, source, Path(temporary), index))
+            paths.append(await _download(client, source, Path(temporary), index, command))
+        await _transfer_status(command, "媒体下载完成，正在重新上传…\n大文件上传可能需要较长时间。")
         if album:
             result = await _send_album(client, sources, destination, paths)
         else:
@@ -361,8 +550,134 @@ def _error_text(exc):
     return f"处理失败（{name}），请检查目标聊天是否已收到内容后再重试。"
 
 
+async def _sources(client, source, single):
+    _media(source)
+    if not source.media_group_id or single:
+        return [source]
+    sources = await _rpc(client.get_media_group, source.chat.id, source.id)
+    sources = sorted(sources, key=lambda item: item.id)
+    if (
+        not 2 <= len(sources) <= 10
+        or len({item.id for item in sources}) != len(sources)
+        or source.id not in {item.id for item in sources}
+        or any(
+            item.media_group_id != source.media_group_id or item.empty
+            for item in sources
+        )
+    ):
+        raise LinkCopyError("无法完整读取相册，请重试或使用 --single。")
+    return sources
+
+
+def _resume_link(link, message_id):
+    if isinstance(link.chat, int):
+        return f"https://t.me/c/{-link.chat - 1000000000000}/{message_id}"
+    return f"https://t.me/{link.chat}/{message_id}"
+
+
+def _batch_checkpoint(state):
+    if state.stop.is_set():
+        raise BatchStopped()
+
+
+async def _batch_pause(state):
+    _batch_checkpoint(state)
+    if BATCH_DELAY > 0:
+        try:
+            await asyncio.wait_for(state.stop.wait(), timeout=BATCH_DELAY)
+        except asyncio.TimeoutError:
+            return
+        raise BatchStopped()
+
+
+async def _run_batch(client, message, start, end, single):
+    chat_id = message.chat.id
+    if chat_id in _batches:
+        raise LinkCopyError("当前聊天已有批量任务；请等待完成或使用 ,linkcopy cancel。")
+    state = BatchState(start, end)
+    destination = _destination(message, False)
+    _batches[chat_id] = state
+    try:
+        await _status(message, "开始批量复制…\n" + state.summary() + "\n停止：,linkcopy cancel")
+        last_status = asyncio.get_running_loop().time()
+        for first in range(start.message_id, end.message_id + 1, BATCH_FETCH_SIZE):
+            _batch_checkpoint(state)
+            ids = list(range(first, min(first + BATCH_FETCH_SIZE, end.message_id + 1)))
+            messages = await _rpc(client.get_messages, start.chat, ids)
+            sources_by_id = {item.id: item for item in messages if item and not item.empty}
+            for mid in ids:
+                if mid in state.handled:
+                    continue
+                _batch_checkpoint(state)
+                source = sources_by_id.get(mid)
+                if not source or source.service or not (
+                    source.text or any(getattr(source, kind, None) for kind in _MEDIA_TYPES)
+                ):
+                    state.skipped += 1
+                    state.handled.add(mid)
+                else:
+                    if source.text:
+                        result = await _rpc(
+                            client.send_message,
+                            **destination,
+                            text=str(source.text),
+                            entities=source.entities,
+                            parse_mode=ParseMode.DISABLED,
+                            link_preview_options=LinkPreviewOptions(is_disabled=True),
+                        )
+                        if not result:
+                            raise LinkCopyError("Telegram 没有返回发送结果，请先检查目标聊天。")
+                        copied = {mid}
+                    else:
+                        sources = await _sources(client, source, single)
+                        # 区间边界裁剪相册；已发成员不重复发送，跨读取批次也保持去重。
+                        sources = [
+                            item for item in sources
+                            if start.message_id <= item.id <= end.message_id
+                            and item.id not in state.handled
+                        ]
+                        _batch_checkpoint(state)
+                        await _copy_media(client, sources, destination, message)
+                        copied = {item.id for item in sources}
+                    state.sent += len(copied)
+                    state.handled.update(copied)
+                    if state.next_id is not None:
+                        await _batch_pause(state)
+                now = asyncio.get_running_loop().time()
+                if now - last_status >= BATCH_STATUS_INTERVAL:
+                    await _status(message, "正在批量复制…\n" + state.summary() + "\n停止：,linkcopy cancel")
+                    last_status = now
+        await _status(message, "批量复制完成。\n" + state.summary())
+    except BatchStopped:
+        text = "批量复制已停止。\n" + state.summary()
+        if state.next_id is not None:
+            text += "\n下次可从此链接继续：" + _resume_link(start, state.next_id)
+        await _status(message, text)
+    except Exception as exc:
+        text = "批量任务已中止。\n" + state.summary() + "\n" + _error_text(exc)
+        if state.next_id is not None:
+            text += (
+                "\n停止于：" + _resume_link(start, state.next_id)
+                + "\n该条或相册可能已送达，请检查目标聊天后再决定从哪里继续；不要直接重跑整个区间。"
+            )
+        raise LinkCopyError(text) from exc
+    finally:
+        _batches.pop(chat_id, None)
+
+
 async def _run(client, message):
-    link, single = _request(message)
+    if (message.arguments or "").strip() == "cancel":
+        state = _batches.get(message.chat.id)
+        if state is None:
+            await _status(message, "当前聊天没有正在运行的批量复制任务。")
+        else:
+            state.stop.set()
+            await _status(message, "已请求停止批量复制；当前下载或发送结束后停止。")
+        return
+    link, single, end = _request(message)
+    if end is not None:
+        await _run_batch(client, message, link, end, single)
+        return
     source = await _rpc(client.get_messages, link.chat, link.message_id)
     if not source or source.empty:
         raise LinkCopyError("消息不存在、已删除，或当前账号无法读取。")
@@ -386,20 +701,7 @@ async def _run(client, message):
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
         return
-    _media(source)
-    sources = [source]
-    if source.media_group_id and not single:
-        sources = await _rpc(client.get_media_group, source.chat.id, source.id)
-        sources = sorted(sources, key=lambda item: item.id)
-        if (
-            not 2 <= len(sources) <= 10
-            or source.id not in {item.id for item in sources}
-            or any(
-                item.media_group_id != source.media_group_id or item.empty
-                for item in sources
-            )
-        ):
-            raise LinkCopyError("无法完整读取相册，请重试或使用 --single。")
+    sources = await _sources(client, source, single)
     from_reply = not [
         arg for arg in (message.arguments or "").split() if arg != "--single"
     ]
@@ -424,8 +726,8 @@ async def _run(client, message):
     command="linkcopy",
     outgoing=True,
     ignore_edited=True,
-    description="将 Telegram 消息链接替换成原文或媒体",
-    parameters="<链接> [--single]（或回复含链接的消息）",
+    description="按消息链接或链接区间复制原文和媒体",
+    parameters="<起始链接> [结束链接] [--single] / cancel（或回复含链接的消息）",
 )
 async def linkcopy(client: Client, message: Message):
     # 来源读取使用当前账号，禁止 sudo 用户通过本命令读取账号的私有频道。

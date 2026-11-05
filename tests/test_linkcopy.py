@@ -33,6 +33,7 @@ class LinkCopyTests(unittest.IsolatedAsyncioTestCase):
             "download_media",
             "edit_message_text",
             "delete_messages",
+            "send_message",
             "send_photo",
             "send_video",
             "send_document",
@@ -143,9 +144,10 @@ class LinkCopyTests(unittest.IsolatedAsyncioTestCase):
         )
         self.command.reply_to_message = reply
         self.command.arguments = ""
-        link, single = module._request(self.command)
+        link, single, end = module._request(self.command)
         self.assertEqual(link.message_id, 42)
         self.assertTrue(single)
+        self.assertIsNone(end)
         reply.text = "https://t.me/example/43"
         with self.assertRaises(module.LinkCopyError):
             module._request(self.command)
